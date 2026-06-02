@@ -9,8 +9,6 @@ import 'package:dartorrent_common/dartorrent_common.dart';
 import 'package:torrent_task/torrent_task.dart';
 import 'package:utp/utp.dart';
 
-import '../utils.dart';
-import 'bitfield.dart';
 import 'peer_event_dispatcher.dart';
 import 'congestion_control.dart';
 import 'speed_calculator.dart';
@@ -85,7 +83,7 @@ abstract class Peer
   int countdownTime = 150;
 
   String? get id {
-    return address?.toContactEncodingString();
+    return address.toContactEncodingString();
   }
 
   /// 下载项目的piece总数
@@ -209,7 +207,6 @@ abstract class Peer
 
   /// 如果具备完整的torrent文件，那它就是一个seeder
   bool get isSeeder {
-    if (_remoteBitfield == null) return false;
     if (_remoteBitfield.haveAll()) return true;
     return false;
   }
@@ -252,7 +249,6 @@ abstract class Peer
 
   /// 远程所有的已完成Piece
   List<int> get remoteCompletePieces {
-    if (_remoteBitfield == null) return [];
     return _remoteBitfield.completedPieces;
   }
 
@@ -260,9 +256,9 @@ abstract class Peer
   Future connect([int timeout = DEFAULT_CONNECT_TIMEOUT]) async {
     try {
       _init();
-      var _stream = await connectRemote(timeout);
+      var stream = await connectRemote(timeout);
       startSpeedCalculator();
-      _streamChunk = _stream.listen(_processReceiveData, onDone: () {
+      _streamChunk = stream.listen(_processReceiveData, onDone: () {
         _log('Connection is closed $address');
         dispose(BadException('远程关闭了连接'));
       }, onError: (e) {
@@ -443,7 +439,7 @@ abstract class Peer
           initRemoteBitfield(message!);
           return; // bitfield message
         case ID_REQUEST:
-          _log('process request from ${address}');
+          _log('process request from $address');
           _processRemoteRequest(message!);
           return; // request message
         // case ID_PIECE:
@@ -486,7 +482,7 @@ abstract class Peer
           return;
       }
     }
-    _log('Cannot process the message', 'Unknown message : ${message}');
+    _log('Cannot process the message', 'Unknown message : $message');
   }
 
   /// 从requestbuffer中将request删除
@@ -533,7 +529,7 @@ abstract class Peer
     var index = view.getUint32(0);
     var begin = view.getUint32(4);
     var length = view.getUint32(8);
-    var requestIndex;
+    int? requestIndex;
     for (var i = 0; i < _remoteRequestBuffer.length; i++) {
       var r = _remoteRequestBuffer[i];
       if (r[0] == index && r[1] == begin) {
@@ -541,10 +537,13 @@ abstract class Peer
         break;
       }
     }
+    // Only remove the matched pending request. Previously requestIndex could
+    // be left unassigned when no match existed, removing the wrong entry (or
+    // throwing). Ignore cancels for requests we no longer hold.
     if (requestIndex != null) {
       _remoteRequestBuffer.removeAt(requestIndex);
-      fireCancel(index, begin, length);
     }
+    fireCancel(index, begin, length);
   }
 
   void _processPortChange(int port) {
@@ -632,9 +631,9 @@ abstract class Peer
   void _processRemoteRequest(Uint8List message) {
     if (_remoteRequestBuffer.length > reqq) {
       dev.log('Request Error:',
-          error: 'Too many requests from ${address}',
+          error: 'Too many requests from $address',
           name: runtimeType.toString());
-      dispose(BadException('Too many requests from ${address}'));
+      dispose(BadException('Too many requests from $address'));
       return;
     }
     var view = ByteData.view(message.buffer);
@@ -645,7 +644,7 @@ abstract class Peer
       dev.log('TOO LARGEt BLOCK',
           error: 'BLOCK $length', name: runtimeType.toString());
       dispose(BadException(
-          '${address} : request block length larger than limit : $length > $MAX_REQUEST_LENGTH'));
+          '$address : request block length larger than limit : $length > $MAX_REQUEST_LENGTH'));
       return;
     }
     if (chokeRemote) {
@@ -670,7 +669,7 @@ abstract class Peer
   /// 不同于其他消息处理，PIECE消息是进行批量处理的。
   void _processReceivePieces(List<Uint8List> messages) {
     var requests = <List<int>>[];
-    messages.forEach((message) {
+    for (var message in messages) {
       var dataHead = Uint8List(8);
       List.copyRange(dataHead, 0, message, 0, 8);
       var view = ByteData.view(dataHead.buffer);
@@ -680,14 +679,14 @@ abstract class Peer
       var request = removeRequest(index, begin, blockLength);
       // 没有请求的就不处理
       if (request == null) {
-        return;
+        continue;
       }
       var block = Uint8List(message.length - 8);
       List.copyRange(block, 0, message, 8);
       requests.add(request);
       _log('收到请求Piece ($index,$begin) 内容, 从当前Peer已下载 $downloaded bytes ');
       firePiece(index, begin, block);
-    });
+    }
     messages.clear();
     ackRequest(requests);
     updateDownload(requests);
@@ -696,11 +695,11 @@ abstract class Peer
 
   void _processHave(List<Uint8List> messages) {
     var indices = <int>[];
-    messages.forEach((message) {
+    for (var message in messages) {
       var index = ByteData.view(message.buffer).getUint32(0);
       indices.add(index);
       updateRemoteBitfield(index, true);
-    });
+    }
     fireHave(indices);
   }
 
@@ -968,7 +967,7 @@ abstract class Peer
   /// index of a piece that has just been successfully downloaded and verified via the hash.
   void sendHave(int index) {
     var bytes = Uint8List(4);
-    _log('发送have信息给对方 : ${bytes},$index');
+    _log('发送have信息给对方 : $bytes,$index');
     ByteData.view(bytes.buffer).setUint32(0, index, Endian.big);
     sendMessage(ID_HAVE, bytes);
   }
@@ -1113,7 +1112,7 @@ abstract class Peer
   void _startToCountdown() {
     _countdownTimer?.cancel();
     _countdownTimer = Timer(Duration(seconds: countdownTime), () {
-      dispose('Over ${countdownTime} seconds no communication, close');
+      dispose('Over $countdownTime seconds no communication, close');
     });
   }
 
@@ -1151,9 +1150,9 @@ abstract class Peer
   int get hashCode => address.address.address.hashCode;
 
   @override
-  bool operator ==(b) {
-    if (b is Peer) {
-      return b.address.address.address == address.address.address;
+  bool operator ==(other) {
+    if (other is Peer) {
+      return other.address.address.address == address.address.address;
     }
     return false;
   }
@@ -1171,15 +1170,16 @@ class BadException implements Exception {
 class TCPConnectException implements Exception {
   final Exception _e;
   TCPConnectException(this._e);
+  @override
+  String toString() => 'TCPConnectException : $_e';
 }
 
 class _TCPPeer extends Peer {
   Socket? _socket;
-  _TCPPeer(String localPeerId, CompactAddress address, List<int> infoHashBuffer,
-      int piecesNum, this._socket,
+  _TCPPeer(super.localPeerId, super.address, super.infoHashBuffer,
+      super.piecesNum, this._socket,
       {bool enableExtend = true, bool enableFast = true})
-      : super(localPeerId, address, infoHashBuffer, piecesNum,
-            type: PeerType.TCP,
+      : super(type: PeerType.TCP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);
 
@@ -1191,7 +1191,11 @@ class _TCPPeer extends Peer {
           timeout: Duration(seconds: timeout));
       return _socket!;
     } catch (e) {
-      throw TCPConnectException(e as TCPConnectException);
+      // BUGFIX: previously `e as TCPConnectException`, but `e` is the
+      // underlying connect failure (e.g. SocketException), never a
+      // TCPConnectException — the cast always threw a TypeError instead of
+      // surfacing the intended wrapper. Wrap the original error instead.
+      throw TCPConnectException(e is Exception ? e : Exception('$e'));
     }
   }
 
@@ -1211,9 +1215,8 @@ class _TCPPeer extends Peer {
       _socket = null;
     } catch (e) {
       // do nothing
-    } finally {
-      return super.dispose(reason);
     }
+    return super.dispose(reason);
   }
 }
 
@@ -1225,11 +1228,10 @@ class _TCPPeer extends Peer {
 class _UTPPeer extends Peer {
   UTPSocketClient? _client;
   UTPSocket? _socket;
-  _UTPPeer(String localPeerId, CompactAddress address, List<int> infoHashBuffer,
-      int piecesNum, this._socket,
+  _UTPPeer(super.localPeerId, super.address, super.infoHashBuffer,
+      super.piecesNum, this._socket,
       {bool enableExtend = true, bool enableFast = true})
-      : super(localPeerId, address, infoHashBuffer, piecesNum,
-            type: PeerType.UTP,
+      : super(type: PeerType.UTP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);
 

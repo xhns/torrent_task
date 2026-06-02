@@ -68,7 +68,7 @@ class PieceManager implements PieceProvider {
     // 查看当前下载piece中是否可以使用该peer
     var avalidatePiece = <int>[];
     // 优先下载Suggest Pieces
-    if (suggestPieces != null && suggestPieces.isNotEmpty) {
+    if (suggestPieces.isNotEmpty) {
       for (var i = 0; i < suggestPieces.length; i++) {
         var p = _pieces[suggestPieces.elementAt(i)];
         if (p != null && p.haveAvalidateSubPiece()) {
@@ -111,9 +111,9 @@ class PieceManager implements PieceProvider {
     _donwloadingPieces.remove(index);
     if (piece != null) {
       piece.dispose();
-      _pieceCompleteHandles.forEach((handle) {
+      for (var handle in _pieceCompleteHandles) {
         Timer.run(() => handle(index));
-      });
+      }
     }
   }
 

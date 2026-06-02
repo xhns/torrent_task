@@ -103,7 +103,7 @@ class Piece {
   ///
   ///当子Piece被弹出栈用于下载，或者子Piece已经下载完成，那么就视为该Piece已经不再包含该子Piece
   bool containsSubpiece(int subIndex) {
-    return subPieceQueue!.contains(subIndex);
+    return subPieceQueue.contains(subIndex);
   }
 
   bool containsAvalidatePeer(String id) {
@@ -111,7 +111,7 @@ class Piece {
   }
 
   bool removeSubpiece(int subIndex) {
-    return subPieceQueue!.remove(subIndex);
+    return subPieceQueue.remove(subIndex);
   }
 
   bool addAvalidatePeer(String id) {
@@ -134,7 +134,9 @@ class Piece {
   bool pushSubPiece(int subIndex) {
     if (subPieceQueue.contains(subIndex) ||
         _writtingSubPieces.contains(subIndex) ||
-        _downloadedSubPieces.contains(subIndex)) return false;
+        _downloadedSubPieces.contains(subIndex)) {
+      return false;
+    }
     subPieceQueue.addFirst(subIndex);
     return true;
   }
@@ -147,7 +149,9 @@ class Piece {
   bool pushSubPieceLast(int index) {
     if (subPieceQueue.contains(index) ||
         _writtingSubPieces.contains(index) ||
-        _downloadedSubPieces.contains(index)) return false;
+        _downloadedSubPieces.contains(index)) {
+      return false;
+    }
     subPieceQueue.addLast(index);
     return true;
   }
@@ -168,9 +172,9 @@ class Piece {
   int get hashCode => hashString.hashCode;
 
   @override
-  bool operator ==(b) {
-    if (b is Piece) {
-      return b.hashString == hashString;
+  bool operator ==(other) {
+    if (other is Piece) {
+      return other.hashString == hashString;
     }
     return false;
   }

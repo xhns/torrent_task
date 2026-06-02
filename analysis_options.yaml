@@ -1,14 +1,13 @@
-# Defines a default set of lint rules enforced for
-# projects at Google. For details and rationale,
-# see https://github.com/dart-lang/pedantic#enabled-lints.
-include: package:pedantic/analysis_options.yaml
+include: package:lints/recommended.yaml
 
-# For lint rules and documentation, see http://dart-lang.github.io/linter/lints.
-# Uncomment to specify additional rules.
-# linter:
-#   rules:
-#     - camel_case_types
-
-analyzer:
-#   exclude:
-#     - path/to/excluded/files/**
+# For lint rules and documentation, see https://dart.dev/tools/linter-rules.
+linter:
+  rules:
+    # The SCREAMING_CASE constants (ID_PREFIX, the BitTorrent message op-codes
+    # CHOKE/UNCHOKE/INTERESTED/HAVE/BITFIELD/REQUEST/PIECE/CANCEL/PORT, BEP9
+    # metadata message ids, ...) are part of the long-standing public API and
+    # wire protocol of this library. Renaming them would be a breaking change,
+    # so the naming lints are disabled instead of mass-renaming exported
+    # identifiers.
+    constant_identifier_names: false
+    non_constant_identifier_names: false

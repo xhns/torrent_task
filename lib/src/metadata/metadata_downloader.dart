@@ -85,10 +85,10 @@ class MetadataDownloader
     _running = false;
     await _dht!.stop();
     var fs = <Future>[];
-    _activePeers.forEach((peer) {
+    for (var peer in _activePeers) {
       unHookPeer(peer);
       fs.add(peer.dispose());
-    });
+    }
     _activePeers.clear();
     _avalidatedPeers.clear();
     _peersAddress.clear();
@@ -169,7 +169,6 @@ class MetadataDownloader
   }
 
   void unHookPeer(Peer peer) {
-    if (peer == null) return;
     peer.offDispose(_processPeerDispose);
     peer.offHandShake(_processPeerHandshake);
     peer.offConnect(_peerConnected);
@@ -242,37 +241,37 @@ class MetadataDownloader
   }
 
   void parseMetaDataMessage(Peer peer, Uint8List data) {
-    var index;
+    int? index;
     var remotePeerId = peer.remotePeerId;
     try {
-      for (var i = 0; i < data.length; i++) {
+      for (var i = 0; i < data.length - 1; i++) {
         if (data[i] == _E && data[i + 1] == _E) {
           index = i + 1;
           break;
         }
       }
-      if (index != null) {
-        var msg = decode(data, start: 0, end: index + 1);
-        if (msg['msg_type'] == 1) {
-          var piece = msg['piece'];
-          if (piece != null && piece < _metaDataBlockNum) {
-            var timer = _requestTimeout.remove(remotePeerId);
-            timer?.cancel();
-            _pieceDownloadComplete(piece, index + 1, data);
-            _requestMetaData(peer);
-          }
-        }
-        if (msg['msg_type'] == 2) {
-          var piece = msg['piece'];
-          if (piece != null && piece < _metaDataBlockNum) {
-            _metaDataPieces.add(piece); //退还拒绝的piece
-            var timer = _requestTimeout.remove(remotePeerId);
-            timer?.cancel();
-            _requestMetaData();
-          }
+      // No bencode dict terminator found - not a valid ut_metadata message.
+      if (index == null) return;
+      var msg = decode(data, start: 0, end: index + 1);
+      if (msg['msg_type'] == 1) {
+        var piece = msg['piece'];
+        if (piece != null && piece < _metaDataBlockNum) {
+          var timer = _requestTimeout.remove(remotePeerId);
+          timer?.cancel();
+          _pieceDownloadComplete(piece, index + 1, data);
+          _requestMetaData(peer);
         }
       }
-    } catch (e) {
+      if (msg['msg_type'] == 2) {
+        var piece = msg['piece'];
+        if (piece != null && piece < _metaDataBlockNum) {
+          _metaDataPieces.add(piece); //退还拒绝的piece
+          var timer = _requestTimeout.remove(remotePeerId);
+          timer?.cancel();
+          _requestMetaData();
+        }
+      }
+        } catch (e) {
       // donothing
     }
   }
@@ -289,11 +288,11 @@ class MetadataDownloader
     if (_completedPieces.length >= _metaDataBlockNum!) {
       // 此时就停止，然后抛出事件
       await stop();
-      _handlers.forEach((h) {
+      for (var h in _handlers) {
         Timer.run(() {
           h(_infoDatas!);
         });
-      });
+      }
       return;
     }
   }

@@ -59,16 +59,16 @@ class LSD {
 
   void _fireLSDPeerEvent(InternetAddress address, int port, String infoHash) {
     var add = CompactAddress(address, port);
-    _peerHandlers.forEach((element) {
+    for (var element in _peerHandlers) {
       Timer.run(() => element(add, infoHash));
-    });
+    }
   }
 
   void _processReceive(String str, InternetAddress source) {
     var strs = str.split('\r\n');
     if (strs[0] != ANNOUNCE_FIREST_LINE) return;
-    var port;
-    var infoHash;
+    int? port;
+    String? infoHash;
     for (var i = 1; i < strs.length; i++) {
       var element = strs[i];
       if (element.startsWith('Port:')) {
@@ -83,7 +83,9 @@ class LSD {
     }
 
     if (port != null && infoHash != null) {
-      if (port >= 0 && port <= 63354 && infoHash.length == 40) {
+      // BUGFIX: upper bound was 63354 (a typo); the maximum TCP/UDP port is
+      // 65535, so announces on ports 63355-65535 were silently dropped.
+      if (port >= 0 && port <= 65535 && infoHash.length == 40) {
         _fireLSDPeerEvent(source, port, infoHash);
       }
     }
@@ -122,7 +124,7 @@ class LSD {
   ///
   ///\r\n
   String _createMessage() {
-    return '${ANNOUNCE_FIREST_LINE}Host: ${LSD_HOST_STRING}Port: ${port}\r\nInfohash: ${_infoHashHex}\r\ncookie: dt-client${_peerId}\r\n\r\n\r\n';
+    return '${ANNOUNCE_FIREST_LINE}Host: ${LSD_HOST_STRING}Port: $port\r\nInfohash: $_infoHashHex\r\ncookie: dt-client$_peerId\r\n\r\n\r\n';
   }
 
   void close() {

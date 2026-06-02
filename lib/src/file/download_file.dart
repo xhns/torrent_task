@@ -161,13 +161,16 @@ class DownloadFile {
 
   Future<RandomAccessFile> getRandomAccessFile(String type) async {
     var file = await _getOrCreateFile();
-    var access;
+    RandomAccessFile access;
     if (type == WRITE) {
       _writeAcces ??= await file.open(mode: FileMode.writeOnlyAppend);
-      access = _writeAcces;
+      access = _writeAcces!;
     } else if (type == READ) {
       _readAccess ??= await file.open(mode: FileMode.read);
-      access = _readAccess;
+      access = _readAccess!;
+    } else {
+      throw ArgumentError(
+          'Unknown random access type "$type", expected $WRITE or $READ');
     }
     if (_sc == null) {
       _sc = StreamController();
@@ -205,20 +208,22 @@ class DownloadFile {
   }
 
   Future delete() async {
+    File? temp;
     try {
       await close();
     } finally {
-      var temp = _file;
+      // Detach the handle regardless of close() outcome, capturing it so the
+      // file can still be removed from disk afterwards.
+      temp = _file;
       _file = null;
-      var r = await temp?.delete();
-      return r;
     }
+    return temp?.delete();
   }
 
   @override
-  bool operator ==(n) {
-    if (n is DownloadFile) {
-      return n.filePath == filePath;
+  bool operator ==(other) {
+    if (other is DownloadFile) {
+      return other.filePath == filePath;
     }
     return false;
   }

@@ -12,7 +12,6 @@ Future<void> main() async {
   model.announces.clear();
   var task = TorrentTask.newTask(model, 'g:/bttest5/');
   Timer? timer;
-  Timer? timer1;
   task.onFileComplete((filepath) {
     print('$filepath downloaded complete');
   });
@@ -20,7 +19,6 @@ Future<void> main() async {
   task.onTaskComplete(() {
     print('Complete!');
     timer?.cancel();
-    timer1?.cancel();
     task.stop();
   });
   task.onStop(() async {
