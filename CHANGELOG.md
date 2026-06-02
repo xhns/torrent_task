@@ -68,3 +68,20 @@
   are not exercised in CI.
 - Add a GitHub Actions CI workflow (clones the six sibling path deps from the
   `chore/modernize-dart3` branch, then `dart pub get` / `analyze` / `test`).
+## 0.4.1
+
+- **Behavior change — rarest-first piece selection.** `BasePieceSelector`
+  previously only performed rarest-first when called with `random == true`
+  (the very first selection of a session). In the steady-state `random == false`
+  path it returned the *first* candidate piece that happened to beat the
+  initial candidate, not the globally rarest one — effectively near-sequential
+  selection. It now always selects the candidate with the fewest available
+  peers (true rarest-first, the standard BitTorrent strategy), breaking ties on
+  fewest remaining sub pieces, then — only when `random == true` — randomly
+  among fully-tied candidates (deterministic first-tie otherwise). This changes
+  which pieces a downloading client requests and the order it requests them,
+  improving copy distribution / swarm health. The public `PieceSelector`
+  interface is unchanged.
+- Add unit tests for the selector: rarest piece chosen regardless of list
+  position, peer-count ties broken by sub-piece count, full ties
+  (deterministic vs. random), unavailable pieces skipped, and empty set → null.
