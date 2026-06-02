@@ -3,7 +3,7 @@ import 'dart:io';
 import 'dart:developer';
 
 import 'package:torrent_model/torrent_model.dart';
-import 'package:path/path.dart' as pathPkg;
+import 'package:path/path.dart' as path_pkg;
 import '../peer/peer_base.dart';
 
 import 'download_file.dart';
@@ -74,15 +74,15 @@ class DownloadFileManager {
   int get piecesNumber => _stateFile.bitfield.piecesNum;
 
   void _subPieceWriteComplete(int pieceIndex, int begin, int length) {
-    _subPieceCompleteHandles.forEach((handle) {
+    for (var handle in _subPieceCompleteHandles) {
       Timer.run(() => handle(pieceIndex, begin, length));
-    });
+    }
   }
 
   void _subPieceWriteFailed(int pieceIndex, int begin, int length) {
-    _subPieceFailedHandles.forEach((handle) {
+    for (var handle in _subPieceFailedHandles) {
       Timer.run(() => handle(pieceIndex, begin, length));
-    });
+    }
   }
 
   Future<bool> updateBitfield(int index, [bool have = true]) {
@@ -98,12 +98,12 @@ class DownloadFileManager {
   }
 
   void _subPieceReadComplete(int pieceIndex, int begin, List<int> block) {
-    _subPieceReadHandles.forEach((h) {
+    for (var h in _subPieceReadHandles) {
       Timer.run(() => h(pieceIndex, begin, block));
-    });
+    }
   }
 
-  int get downloaded => _stateFile!.downloaded;
+  int get downloaded => _stateFile.downloaded;
 
   /// 该方法看似只将缓冲区内容写入磁盘，实际上
   /// 每当缓存写入后都会认为该[pieceIndex]对应`Piece`已经完成，则会去移除
@@ -145,16 +145,16 @@ class DownloadFileManager {
   }
 
   void _fireFileComplete(String path) {
-    _fileCompleteHandles.forEach((element) {
+    for (var element in _fileCompleteHandles) {
       Timer.run(() => element(path));
-    });
+    }
   }
 
   void _initFileMap(String directory) {
     _parentDir = directory;
     for (var i = 0; i < metainfo.files.length; i++) {
       var file = metainfo.files[i];
-      var df = DownloadFile(pathPkg.join(directory,file.path), file.offset, file.length);
+      var df = DownloadFile(path_pkg.join(directory,file.path), file.offset, file.length);
       _files.add(df);
       var fs = df.start;
       var fe = df.end;
@@ -282,7 +282,7 @@ class DownloadFileManager {
   }
 
   Future close() async {
-    await _stateFile?.close();
+    await _stateFile.close();
     for (var i = 0; i < _files.length; i++) {
       var file = _files.elementAt(i);
       await file.close();
@@ -291,16 +291,16 @@ class DownloadFileManager {
   }
 
   void _clean() {
-    _subPieceCompleteHandles?.clear();
-    _subPieceFailedHandles?.clear();
-    _subPieceReadHandles?.clear();
-    _fileCompleteHandles?.clear();
-    _file2pieceMap?.clear();
+    _subPieceCompleteHandles.clear();
+    _subPieceFailedHandles.clear();
+    _subPieceReadHandles.clear();
+    _fileCompleteHandles.clear();
+    _file2pieceMap.clear();
     _piece2fileMap = null;
   }
 
   Future delete() async {
-    await _stateFile?.delete();
+    await _stateFile.delete();
     var dirs = <String>{};
     for (var i = 0; i < _files.length; i++) {
       var file = _files.elementAt(i);
@@ -312,8 +312,8 @@ class DownloadFileManager {
       }
       var tmpPath = file.filePath;
       do{
-        tmpPath = pathPkg.dirname(tmpPath);
-      }while(pathPkg.dirname(tmpPath) != _parentDir && pathPkg.dirname(tmpPath) != '.' && pathPkg.dirname(tmpPath) != '/');
+        tmpPath = path_pkg.dirname(tmpPath);
+      }while(path_pkg.dirname(tmpPath) != _parentDir && path_pkg.dirname(tmpPath) != '.' && path_pkg.dirname(tmpPath) != '/');
 
       dirs.add(tmpPath);
     }

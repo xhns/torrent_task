@@ -58,7 +58,7 @@ mixin Holepunch {
     } catch (e) {
       // do nothing
     }
-    var err;
+    int err;
     if (type == 0x02) {
       var e = Uint8List(4);
       // 有些客户端返回的error不到4位：

@@ -224,12 +224,11 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   }
 
   void _processTrackerPeerEvent(Tracker source, PeerEvent event) {
-    if (event == null) return;
     var ps = event.peers;
-    if (ps != null && ps.isNotEmpty) {
-      ps.forEach((url) {
+    if (ps.isNotEmpty) {
+      for (var url in ps) {
         _processNewPeerFound(url);
-      });
+      }
     }
   }
 
@@ -329,9 +328,9 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     await _tracker?.stop(force);
     var tempHandler = Set<Function>.from(_stopHandlers);
     await dispose();
-    tempHandler.forEach((element) {
+    for (var element in tempHandler) {
       Timer.run(() => element());
-    });
+    }
     tempHandler.clear();
     //tempHandler = null;
   }
@@ -386,9 +385,9 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   }
 
   void _fireFileComplete(String filepath) {
-    _fileCompleteHandlers.forEach((handler) {
+    for (var handler in _fileCompleteHandlers) {
       Timer.run(() => handler(filepath));
-    });
+    }
   }
 
   @override
@@ -437,9 +436,9 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   }
 
   void _fireTaskComplete() {
-    _taskCompleteHandlers.forEach((element) {
+    for (var element in _taskCompleteHandlers) {
       Timer.run(() => element());
-    });
+    }
   }
 
   @override
@@ -457,15 +456,15 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   }
 
   void _fireTaskPaused() {
-    _pauseHandlers.forEach((element) {
+    for (var element in _pauseHandlers) {
       Timer.run(() => element());
-    });
+    }
   }
 
   void _fireTaskResume() {
-    _resumeHandlers.forEach((element) {
+    for (var element in _resumeHandlers) {
       Timer.run(() => element());
-    });
+    }
   }
 
   @override

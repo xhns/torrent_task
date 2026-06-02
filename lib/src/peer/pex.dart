@@ -34,31 +34,31 @@ mixin PEX {
   void _sendUt_pex_peers() {
     var dropped = <CompactAddress>[];
     var added = <CompactAddress>[];
-    activePeers.forEach((p) {
+    for (var p in activePeers) {
       if (!_lastUTPEX.remove(p.address)) {
         added.add(p.address);
       }
-    });
-    _lastUTPEX.forEach((element) {
+    }
+    for (var element in _lastUTPEX) {
       dropped.add(element);
-    });
+    }
     _lastUTPEX.clear();
 
     var data = {};
     data['added'] = [];
-    added.forEach((element) {
+    for (var element in added) {
       _lastUTPEX.add(element);
       data['added'].addAll(element.toBytes());
-    });
+    }
     data['dropped'] = [];
-    dropped.forEach((element) {
+    for (var element in dropped) {
       data['dropped'].addAll(element.toBytes());
-    });
+    }
     if (data['added'].isEmpty && data['dropped'].isEmpty) return;
     var message = encode(data);
-    activePeers.forEach((peer) {
+    for (var peer in activePeers) {
       peer.sendExtendMessage('ut_pex', message as Uint8List);
-    });
+    }
   }
 
   dynamic parsePEXDatas(dynamic source, Uint8List message) {

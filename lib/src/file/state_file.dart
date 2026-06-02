@@ -3,7 +3,7 @@ import 'dart:developer';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:torrent_model/torrent_model.dart';
-import 'package:path/path.dart' as pathPkg;
+import 'package:path/path.dart' as path_pkg;
 import '../peer/bitfield.dart';
 
 const BITFIELD_TYPE = 'bitfield';
@@ -46,11 +46,11 @@ class StateFile {
   Bitfield get bitfield => _bitfield!;
 
   int get downloaded {
-    var _downloaded = bitfield.completedPieces.length * metainfo!.pieceLength!;
+    var downloaded = bitfield.completedPieces.length * metainfo!.pieceLength!;
     if (bitfield.completedPieces.contains(bitfield.piecesNum - 1)) {
-      _downloaded -= metainfo!.pieceLength! - metainfo!.lastPriceLength!;
+      downloaded -= metainfo!.pieceLength! - metainfo!.lastPriceLength!;
     }
-    return _downloaded;
+    return downloaded;
   }
 
   int get uploaded => _uploaded;
@@ -64,7 +64,7 @@ class StateFile {
 
     _bitfieldFile = File('${directoryPath}${metainfo.infoHash}.bt.state');
      */
-    _bitfieldFile = File(pathPkg.join(directoryPath,'${metainfo.infoHash}.bt.state'));
+    _bitfieldFile = File(path_pkg.join(directoryPath,'${metainfo.infoHash}.bt.state'));
     var exists = await _bitfieldFile!.exists();
     if (!exists) {
       _bitfieldFile = await _bitfieldFile!.create(recursive: true);

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:dartorrent_common/dartorrent_common.dart';
 import 'package:torrent_model/torrent_model.dart';
@@ -13,13 +12,11 @@ void main() async {
     // model.announces.clear();
     var task = TorrentTask.newTask(model, savePath);
     Timer? timer;
-    Timer? timer1;
     var startTime = DateTime.now().millisecondsSinceEpoch;
     task.onTaskComplete(() {
       print(
           'Complete! spend time : ${((DateTime.now().millisecondsSinceEpoch - startTime) / 60000).toStringAsFixed(2)} minutes');
       timer?.cancel();
-      timer1?.cancel();
       task.stop();
     });
     task.onStop(() async {
@@ -29,29 +26,29 @@ void main() async {
 
     // ignore: unawaited_futures
     findPublicTrackers().listen((alist) {
-      alist.forEach((element) {
+      for (var element in alist) {
         task.startAnnounceUrl(element, model.infoHashBuffer!);
-      });
+      }
     });
 
-    model.nodes?.forEach((element) {
+    for (var element in model.nodes) {
       task.addDHTNode(element);
-    });
+    }
     print(map);
 
     timer = Timer.periodic(Duration(seconds: 2), (timer) async {
       var progress = '${(task.progress * 100).toStringAsFixed(2)}%';
       var ads =
-          '${((task.averageDownloadSpeed) * 1000 / 1024).toStringAsFixed(2)}';
+          ((task.averageDownloadSpeed) * 1000 / 1024).toStringAsFixed(2);
       var aps =
-          '${((task.averageUploadSpeed) * 1000 / 1024).toStringAsFixed(2)}';
+          ((task.averageUploadSpeed) * 1000 / 1024).toStringAsFixed(2);
       var ds =
-          '${((task.currentDownloadSpeed) * 1000 / 1024).toStringAsFixed(2)}';
-      var ps = '${((task.uploadSpeed) * 1000 / 1024).toStringAsFixed(2)}';
+          ((task.currentDownloadSpeed) * 1000 / 1024).toStringAsFixed(2);
+      var ps = ((task.uploadSpeed) * 1000 / 1024).toStringAsFixed(2);
 
       var utpd =
-          '${((task.utpDownloadSpeed) * 1000 / 1024).toStringAsFixed(2)}';
-      var utpu = '${((task.utpUploadSpeed) * 1000 / 1024).toStringAsFixed(2)}';
+          ((task.utpDownloadSpeed) * 1000 / 1024).toStringAsFixed(2);
+      var utpu = ((task.utpUploadSpeed) * 1000 / 1024).toStringAsFixed(2);
       var utpc = task.utpPeerCount;
 
       var active = task.connectedPeersNumber;
