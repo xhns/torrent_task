@@ -15,7 +15,7 @@ jobs:
       - name: Clone sibling deps
         run: |
           for r in bencode_dart dartorrent_common utp torrent_model torrent_tracker dht; do
-            git clone --depth 1 --branch chore/modernize-dart3 \
+            git clone --depth 1 \
               https://github.com/xhns/$r.git "$GITHUB_WORKSPACE/../$r"
           done
 
