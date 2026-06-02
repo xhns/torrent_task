@@ -134,8 +134,15 @@ abstract class Peer
   /// 远程数据接受，监听subcription
   StreamSubscription? _streamChunk;
 
-  /// 从通道中获取数据的buffer
-  List<int> _cacheBuffer = [];
+  /// Буфер приёмного канала: `Uint8List` + курсор вместо растущего `List<int>`
+  /// с `sublist`. Валидные данные лежат в `_recvBuf[_recvStart.._recvEnd)`;
+  /// чтение по индексу относительно `_recvStart`, потребление продвигает
+  /// `_recvStart`, перекомпакция/рост — только при нехватке места
+  /// (амортизированно O(1)). Снимает с main-изолята покопийный пересбор хвоста
+  /// на каждый разбор (перф-аудит, находка #1).
+  Uint8List _recvBuf = Uint8List(0);
+  int _recvStart = 0;
+  int _recvEnd = 0;
 
   /// 本地发送请求buffer。格式位：[index,begin,length]
   final _requestBuffer = <List<int>>[];
@@ -279,7 +286,7 @@ abstract class Peer
     _disposed = false;
     _handShaked = false;
     // 清空通道数据缓存：
-    _cacheBuffer.clear();
+    _resetRecv();
     // 清空请求缓存
     _requestBuffer.clear();
     _remoteRequestBuffer.clear();
@@ -323,24 +330,76 @@ abstract class Peer
     return _requestBuffer.isNotEmpty;
   }
 
+  // --- Приёмный буфер (Uint8List + курсор) ---------------------------------
+
+  /// Сколько валидных байт сейчас в буфере.
+  int get _recvAvailable => _recvEnd - _recvStart;
+
+  /// Байт по индексу относительно начала валидной области.
+  int _recvByte(int i) => _recvBuf[_recvStart + i];
+
+  /// Big-endian uint32 по индексу относительно начала валидной области.
+  int _recvUint32(int i) {
+    final s = _recvStart + i;
+    return (_recvBuf[s] << 24) |
+        (_recvBuf[s + 1] << 16) |
+        (_recvBuf[s + 2] << 8) |
+        _recvBuf[s + 3];
+  }
+
+  /// Дописать поступившие байты в хвост. Перекомпакция (сдвиг валидной области
+  /// к началу) или рост буфера (×2, ≥1 КБ) — только если в хвосте не хватает
+  /// места. Никаких per-read `sublist`-копий хвоста.
+  void _appendToRecv(List<int> data) {
+    final n = data.length;
+    if (n == 0) return;
+    if (_recvBuf.length - _recvEnd < n) {
+      final avail = _recvEnd - _recvStart;
+      if (_recvBuf.length - avail >= n) {
+        // хватит места после сдвига валидной области к нулю.
+        _recvBuf.setRange(0, avail, _recvBuf, _recvStart);
+      } else {
+        // и после сдвига мало — растим (dest 0 < src ⇒ forward-copy безопасен).
+        var cap = _recvBuf.isEmpty ? 1024 : _recvBuf.length * 2;
+        while (cap < avail + n) {
+          cap *= 2;
+        }
+        final nb = Uint8List(cap);
+        nb.setRange(0, avail, _recvBuf, _recvStart);
+        _recvBuf = nb;
+      }
+      _recvStart = 0;
+      _recvEnd = avail;
+    }
+    _recvBuf.setRange(_recvEnd, _recvEnd + n, data);
+    _recvEnd += n;
+  }
+
+  /// Снять [n] байт с начала валидной области.
+  void _consumeRecv(int n) {
+    _recvStart += n;
+    if (_recvStart >= _recvEnd) _resetRecv();
+  }
+
+  void _resetRecv() {
+    _recvStart = 0;
+    _recvEnd = 0;
+  }
+
   void _processReceiveData(dynamic data) {
     // 不管收到什么消息，只要不是空的，重置倒计时:
     if (data != null && data.isNotEmpty) _startToCountdown();
-    // if (data.isNotEmpty) log('收到数据 $data');
-    if (data != null) _cacheBuffer.addAll(data); // 接受remote发送数据。缓冲到一处
-    if (_cacheBuffer.isEmpty) return;
+    if (data != null) _appendToRecv(data as List<int>); // буферизуем приём
+    if (_recvAvailable == 0) return;
     // 查看是不是handshake头
-    if (_cacheBuffer[0] == 19 && _cacheBuffer.length >= 68) {
-      if (_isHandShakeHead(_cacheBuffer)) {
-        if (_validateInfoHash(_cacheBuffer)) {
+    if (_recvByte(0) == 19 && _recvAvailable >= 68) {
+      if (_isHandShakeHeadAt()) {
+        if (_validateInfoHashAt()) {
           var handshakeBuffer = Uint8List(68);
-          List.copyRange(handshakeBuffer, 0, _cacheBuffer, 0, 68);
-          _cacheBuffer = _cacheBuffer.sublist(68);
+          handshakeBuffer.setRange(0, 68, _recvBuf, _recvStart);
+          _consumeRecv(68);
           Timer.run(() => _processHandShake(handshakeBuffer));
-          if (_cacheBuffer.isNotEmpty) {
-            Timer.run(() => _processReceiveData(null));
-          }
-          return;
+          // Остаток разбираем тем же проходом ниже (без повторного Timer.run-входа).
         } else {
           // If infohash buffer is incorret , dispose this peer
           dispose('Infohash is incorret');
@@ -348,38 +407,55 @@ abstract class Peer
         }
       }
     }
-    if (_cacheBuffer.length >= 4) {
+    if (_recvAvailable >= 4) {
       var start = 0;
-      var lengthBuffer = Uint8List(4);
-      List.copyRange(lengthBuffer, 0, _cacheBuffer, start, 4);
-      var length = ByteData.view(lengthBuffer.buffer).getInt32(0, Endian.big);
-      List<Uint8List>? piecesMessage;
-      List<Uint8List>? haveMessages;
-      while (_cacheBuffer.length - start - 4 >= length) {
+      var length = _recvUint32(start);
+      // Куски — единственной копией (index/begin читаем прямо из буфера),
+      // раньше блок копировался 2 раза (buffer→messageBuffer→block), находка #2.
+      List<(int index, int begin, Uint8List block)>? piecesMessage;
+      List<int>? haveMessages;
+      // Управляющие сообщения батчим в один Timer.run (а не по одному на
+      // сообщение), сохраняя порядок «контролы → куски → have», находка #3.
+      List<(int? id, Uint8List? message)>? controlMessages;
+      while (_recvAvailable - start - 4 >= length) {
         if (length == 0) {
-          Timer.run(() => _processMessage(null, null));
+          (controlMessages ??= []).add((null, null));
         } else {
-          var messageBuffer = Uint8List(length - 1);
-          var id = _cacheBuffer[start + 4];
-          List.copyRange(
-              messageBuffer, 0, _cacheBuffer, start + 5, start + 4 + length);
+          var id = _recvByte(start + 4);
           switch (id) {
             case ID_PIECE:
-              piecesMessage ??= <Uint8List>[];
-              piecesMessage.add(messageBuffer);
+              // payload = [index(4)][begin(4)][block(length-9)]
+              var index = _recvUint32(start + 5);
+              var begin = _recvUint32(start + 9);
+              var blockLen = length - 9;
+              var block = Uint8List(blockLen);
+              if (blockLen > 0) {
+                block.setRange(
+                    0, blockLen, _recvBuf, _recvStart + start + 13);
+              }
+              (piecesMessage ??= []).add((index, begin, block));
               break;
             case ID_HAVE:
-              haveMessages ??= <Uint8List>[];
-              haveMessages.add(messageBuffer);
+              (haveMessages ??= []).add(_recvUint32(start + 5));
               break;
             default:
-              Timer.run(() => _processMessage(id, messageBuffer));
+              var messageBuffer = Uint8List(length - 1);
+              messageBuffer.setRange(
+                  0, length - 1, _recvBuf, _recvStart + start + 5);
+              (controlMessages ??= []).add((id, messageBuffer));
           }
         }
         start += (length + 4);
-        if (_cacheBuffer.length - start < 4) break;
-        List.copyRange(lengthBuffer, 0, _cacheBuffer, start, start + 4);
-        length = ByteData.view(lengthBuffer.buffer).getInt32(0, Endian.big);
+        if (_recvAvailable - start < 4) break;
+        length = _recvUint32(start);
+      }
+      // Порядок планирования = порядок исполнения (Timer FIFO): контролы, куски, have.
+      if (controlMessages != null) {
+        Timer.run(() {
+          for (final m in controlMessages!) {
+            _processMessage(m.$1, m.$2);
+          }
+        });
       }
       if (piecesMessage != null && piecesMessage.isNotEmpty) {
         Timer.run(() => _processReceivePieces(piecesMessage!));
@@ -387,21 +463,21 @@ abstract class Peer
       if (haveMessages != null && haveMessages.isNotEmpty) {
         Timer.run(() => _processHave(haveMessages!));
       }
-      if (start != 0) _cacheBuffer = _cacheBuffer.sublist(start);
+      if (start != 0) _consumeRecv(start);
     }
   }
 
-  bool _isHandShakeHead(buffer) {
-    if (buffer.length < 68) return false;
+  bool _isHandShakeHeadAt() {
+    if (_recvAvailable < 68) return false;
     for (var i = 0; i < 20; i++) {
-      if (buffer[i] != HAND_SHAKE_HEAD[i]) return false;
+      if (_recvByte(i) != HAND_SHAKE_HEAD[i]) return false;
     }
     return true;
   }
 
-  bool _validateInfoHash(buffer) {
+  bool _validateInfoHashAt() {
     for (var i = 28; i < 48; i++) {
-      if (buffer[i] != _infoHashBuffer[i - 28]) return false;
+      if (_recvByte(i) != _infoHashBuffer[i - 28]) return false;
     }
     return true;
   }
@@ -667,22 +743,14 @@ abstract class Peer
   /// 处理接收到的PIECE消息
   ///
   /// 不同于其他消息处理，PIECE消息是进行批量处理的。
-  void _processReceivePieces(List<Uint8List> messages) {
+  void _processReceivePieces(List<(int index, int begin, Uint8List block)> messages) {
     var requests = <List<int>>[];
-    for (var message in messages) {
-      var dataHead = Uint8List(8);
-      List.copyRange(dataHead, 0, message, 0, 8);
-      var view = ByteData.view(dataHead.buffer);
-      var index = view.getUint32(0);
-      var begin = view.getUint32(4);
-      var blockLength = message.length - 8;
-      var request = removeRequest(index, begin, blockLength);
+    for (var (index, begin, block) in messages) {
+      var request = removeRequest(index, begin, block.length);
       // 没有请求的就不处理
       if (request == null) {
         continue;
       }
-      var block = Uint8List(message.length - 8);
-      List.copyRange(block, 0, message, 8);
       requests.add(request);
       _log('收到请求Piece ($index,$begin) 内容, 从当前Peer已下载 $downloaded bytes ');
       firePiece(index, begin, block);
@@ -693,11 +761,8 @@ abstract class Peer
     startRequestDataTimeout();
   }
 
-  void _processHave(List<Uint8List> messages) {
-    var indices = <int>[];
-    for (var message in messages) {
-      var index = ByteData.view(message.buffer).getUint32(0);
-      indices.add(index);
+  void _processHave(List<int> indices) {
+    for (var index in indices) {
       updateRemoteBitfield(index, true);
     }
     fireHave(indices);
