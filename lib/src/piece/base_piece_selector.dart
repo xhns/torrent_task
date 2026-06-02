@@ -5,69 +5,73 @@ import 'piece_provider.dart';
 import 'piece_selector.dart';
 
 ///
-/// `Piece`基础选择器。
+/// `Piece` 基础选择器（rarest-first 策略）。
 ///
-/// 基本策略为：
+/// 选择策略：
 ///
-/// - `Piece`可用`Peer`数量最多
-/// - 在可用`Peer`数量都相同的情况下，选用`Sub Piece`数量最少的
+/// - 在该 `Peer` 可下载的候选 `Piece` 中，优先选择可用 `Peer` 数量最少的
+///   （即最稀有的）`Piece`；
+/// - 可用 `Peer` 数量相同时，优先选择剩余 `Sub Piece` 数量最少的，
+///   以尽快补齐已经下载了一部分的 `Piece`；
+/// - 上述两项都相同时，在并列的候选中随机挑选一个，避免所有 `Peer`
+///   都抢同一个 `Piece`。
+///
+/// 这是标准的 BitTorrent rarest-first 策略：优先获取整个 swarm 中最稀缺的
+/// 数据，从而提升副本分布的健康度。`random` 参数仅影响并列项的处理，不再
+/// 改变是否走 rarest-first：无论 `random` 是 `true` 还是 `false`，返回的
+/// 都是真正最稀有的 `Piece`。
 class BasePieceSelector implements PieceSelector {
   @override
   Piece? selectPiece(
       String remotePeerId, List<int> piecesIndexList, PieceProvider provider,
       [bool random = false]) {
-    // random = true;
-    var maxList = <Piece>[];
-    Piece? a;
-    int? startIndex;
+    // 收集该 peer 真正可下载的候选 piece（有可用 sub piece，且该 peer 持有）。
+    Piece? best;
+    // 与 best 在 (availablePeers, availableSubPieces) 上完全并列的候选集合，
+    // 用于并列时的（可选）随机决断。
+    var ties = <Piece>[];
     for (var i = 0; i < piecesIndexList.length; i++) {
-      var p = provider[piecesIndexList[i]];
-      if (p != null &&
-          p.haveAvalidateSubPiece() &&
-          p.containsAvalidatePeer(remotePeerId)) {
-        a = p;
-        startIndex = i;
-        break;
-      }
-    }
-    // No downloadable piece available for this peer.
-    if (a == null || startIndex == null) return null;
-    var current = a;
-    maxList.add(current);
-    for (var i = startIndex; i < piecesIndexList.length; i++) {
       var p = provider[piecesIndexList[i]];
       if (p == null ||
           !p.haveAvalidateSubPiece() ||
           !p.containsAvalidatePeer(remotePeerId)) {
         continue;
       }
-      // 选择稀有piece
-      if (current.avalidatePeersCount > p.avalidatePeersCount) {
-        if (!random) return p;
-        maxList.clear();
-        current = p;
-        maxList.add(current);
-      } else {
-        if (current.avalidatePeersCount == p.avalidatePeersCount) {
-          // 如果同样数量可用下载peer的piece所具有的sub piece少，优先处理
-          if (p.avalidateSubPieceCount < current.avalidateSubPieceCount) {
-            if (!random) return p;
-            maxList.clear();
-            current = p;
-            maxList.add(current);
-          } else {
-            if (p.avalidateSubPieceCount == current.avalidateSubPieceCount) {
-              if (!random) return p;
-              maxList.add(p);
-              current = p;
-            }
-          }
-        }
+      if (best == null) {
+        best = p;
+        ties = [p];
+        continue;
+      }
+      var cmp = _compare(p, best);
+      if (cmp < 0) {
+        // p 更稀有（或同样稀有但 sub piece 更少）—— 成为新的最优。
+        best = p;
+        ties = [p];
+      } else if (cmp == 0) {
+        // 与当前最优完全并列。
+        ties.add(p);
       }
     }
-    if (random) {
-      return maxList[randomInt(maxList.length)];
+    // 没有任何可下载的 piece。
+    if (best == null) return null;
+    // 默认（random == true 时）在并列项里随机选，分散 peer 的请求；
+    // random == false 时返回稳定的第一个最优项以保证确定性。
+    if (random && ties.length > 1) {
+      return ties[randomInt(ties.length)];
     }
-    return current;
+    return best;
+  }
+
+  /// 比较两个候选 `Piece` 的优先级。
+  ///
+  /// 返回值 < 0 表示 [a] 比 [b] 更应优先下载（更稀有，或同样稀有但剩余
+  /// sub piece 更少）；> 0 表示 [b] 更优先；0 表示二者并列。
+  int _compare(Piece a, Piece b) {
+    // 主键：可用 peer 数量越少越稀有，优先。
+    if (a.avalidatePeersCount != b.avalidatePeersCount) {
+      return a.avalidatePeersCount - b.avalidatePeersCount;
+    }
+    // 次键：剩余 sub piece 越少越优先（尽快补齐部分下载的 piece）。
+    return a.avalidateSubPieceCount - b.avalidateSubPieceCount;
   }
 }
