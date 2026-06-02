@@ -85,3 +85,31 @@
 - Add unit tests for the selector: rarest piece chosen regardless of list
   position, peer-count ties broken by sub-piece count, full ties
   (deterministic vs. random), unavailable pieces skipped, and empty set → null.
+
+## 0.5.0
+
+- **Feature — force re-verify (recheck).** Add the standard BitTorrent
+  "force re-check": verify the files already present on disk against the
+  torrent's per-piece SHA1 hashes and rebuild the local bitfield, so a fresh
+  task pointed at a folder of previously downloaded files (with no
+  `<infohash>.bt.state`) recognises complete books as complete/seeding and
+  resumes partial ones from the right offset instead of re-downloading
+  everything.
+  - New `TorrentTask.recheck()` → `Future<int>` (returns the number of verified
+    pieces). It lazily creates the `StateFile`, verifies on-disk files and
+    persists the reconciled bitfield. Intended to be called **before**
+    `start()`; the existing happy path is unchanged when it is not called.
+  - New standalone `verifyExistingFiles(Torrent metainfo, String downloadDir)`
+    → `Future<RecheckResult>` for callers that just want the reconstructed
+    bitfield without a task. Exported from `package:torrent_task/torrent_task.dart`.
+  - Each piece is read from disk in bounded 64 KiB chunks (no whole-file/whole-
+    piece buffering) and SHA1-hashed; the last (short) piece is hashed at
+    `lastPriceLength`, and pieces straddling file boundaries are reassembled
+    across files. Missing, short, or corrupt files leave their pieces unset.
+    Read handles are opened read-only and always closed; no file is created or
+    mutated.
+- Add `crypto` as a direct dependency (used for piece SHA1 verification).
+- Add tests covering: all-valid → complete, single corrupted piece, missing
+  file, short last piece (valid + corrupt), multi-file straddling piece (both
+  present + one missing), empty dir, and the `TorrentTask.recheck()`
+  integration with persistence across a reopened `StateFile`.
