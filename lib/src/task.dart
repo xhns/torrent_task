@@ -9,6 +9,7 @@ import 'package:dartorrent_common/dartorrent_common.dart';
 import 'package:dht_dart/dht_dart.dart';
 
 import 'file/download_file_manager.dart';
+import 'file/recheck.dart';
 import 'file/state_file.dart';
 import 'lsd/lsd.dart';
 import 'peer/peer.dart';
@@ -56,6 +57,22 @@ abstract class TorrentTask {
 
   /// Downloaded percent
   double get progress;
+
+  /// Force re-verify the files already present on disk against the torrent's
+  /// piece hashes, rebuilding (and persisting) the local bitfield.
+  ///
+  /// This is the standard BitTorrent "force re-check". It is meant to be called
+  /// **before** [start]: a fresh task pointed at a folder of previously
+  /// downloaded files (with no `.bt.state` file) would otherwise assume nothing
+  /// is downloaded and re-fetch everything. After [recheck], fully present and
+  /// hash-correct torrents come up complete/seeding, and partial ones resume
+  /// from the right place.
+  ///
+  /// Each piece is read from disk in bounded chunks, SHA1-hashed and compared to
+  /// `metainfo.pieces[i]`; matches set the bit in the [StateFile], missing or
+  /// corrupt pieces stay unset. Returns the number of verified (complete)
+  /// pieces.
+  Future<int> recheck();
 
   /// Start to download
   Future start();
@@ -279,6 +296,28 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
       _peersManager?.resume();
       _fireTaskResume();
     }
+  }
+
+  @override
+  Future<int> recheck() async {
+    final model = _metaInfo!;
+    // Ensure a StateFile exists so verified pieces are persisted across runs.
+    // This is safe to do before start(); start() reuses the same instance via
+    // its `??=` guards.
+    _stateFile ??= await StateFile.getStateFile(_savePath, model);
+    final stateFile = _stateFile!;
+
+    final result = await verifyExistingFiles(model, _savePath);
+
+    // Reconcile the persisted bitfield with what we just verified on disk:
+    // set bits for pieces that now hash-check, clear ones that no longer do.
+    for (var i = 0; i < result.totalPieces; i++) {
+      final have = result.bitfield.getBit(i);
+      if (stateFile.bitfield.getBit(i) != have) {
+        await stateFile.updateBitfield(i, have);
+      }
+    }
+    return result.verifiedPieces;
   }
 
   @override
