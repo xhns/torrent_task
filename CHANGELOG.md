@@ -32,3 +32,39 @@
 
 ## 0.3.0
 - Add Send Metadata extension (BEP0009)
+
+## 0.4.0
+- Modernize to Dart 3 (`sdk: '>=3.0.0 <4.0.0'`); clean up stale commented
+  path-dependency lines and the malformed `bencode_dart :` key in `pubspec.yaml`.
+- Declare the previously-implicit `path` dependency explicitly; mark the package
+  `publish_to: none` (all dependencies are local path deps).
+- Switch linting to `package:lints/recommended.yaml`; drop `pedantic`.
+  `dart analyze --fatal-infos` is clean. SCREAMING_CASE protocol constants and
+  the wire op-code identifiers are intentionally preserved (naming lints
+  disabled in `analysis_options.yaml`).
+- Bug fixes surfaced by the null-safety review (behaviour/protocol preserved):
+  - `peer.dart` `_TCPPeer.connectRemote`: `throw TCPConnectException(e as
+    TCPConnectException)` always raised a `TypeError` instead of the intended
+    wrapper; now wraps the real connect failure.
+  - `peer.dart` `_processCancel`: when a cancelled request was not in the
+    buffer, an unassigned index removed the wrong entry (or threw); now removes
+    only on a match.
+  - `lsd.dart`: announce port upper bound was the typo `63354`; corrected to
+    `65535`, so peers on ports 63355-65535 are no longer dropped. Also guard a
+    missing `Infohash:` field.
+  - `base_piece_selector.dart`: returns `null` when no piece is downloadable
+    instead of crashing on an unassigned variable.
+  - `download_file.dart` `getRandomAccessFile`: throws `ArgumentError` on an
+    unknown access type instead of returning `null` from a non-nullable Future;
+    `delete()` no longer `return`s inside a `finally` (which swallowed errors).
+  - `metadata_downloader.dart`: guard a missing bencode terminator and fix an
+    off-by-one `data[i + 1]` read at the end of the buffer.
+  - `peers_manager.dart` `disposeAllSeeder`: iterate a snapshot to avoid
+    concurrent-modification while `dispose()` mutates the active-peer set.
+- Replace the symbolic tests with a real unit suite (22 tests): bitfield logic,
+  peer-id/hex utils, BEP9 metadata and PEX bencode round-trips, piece-selector
+  logic, and a loopback-TCP peer wire round-trip (handshake, choke/unchoke,
+  interested, have, bitfield, request, port). Network/swarm/tracker/DHT paths
+  are not exercised in CI.
+- Add a GitHub Actions CI workflow (clones the six sibling path deps from the
+  `chore/modernize-dart3` branch, then `dart pub get` / `analyze` / `test`).
