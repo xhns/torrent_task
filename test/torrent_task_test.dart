@@ -173,6 +173,97 @@ void main() {
             reason: 'random=$random must pick a real candidate');
       }
     });
+
+    test('rarest-first: picks the piece with the fewest available peers', () {
+      final selector = BasePieceSelector();
+      // p2 is the rarest (2 peers). It is neither first nor last in the list,
+      // which is exactly the case the old "return first that beats current"
+      // logic got wrong.
+      final p0 = _FakePiece(0, peers: 9, subPieces: 4);
+      final p1 = _FakePiece(1, peers: 5, subPieces: 4);
+      final p2 = _FakePiece(2, peers: 2, subPieces: 4);
+      final p3 = _FakePiece(3, peers: 7, subPieces: 4);
+      final provider = _FakePieceProvider({0: p0, 1: p1, 2: p2, 3: p3});
+      for (final random in [false, true]) {
+        final picked =
+            selector.selectPiece('peerA', [0, 1, 2, 3], provider, random);
+        expect(picked, same(p2), reason: 'random=$random must pick rarest');
+      }
+    });
+
+    test('rarest-first: rarest piece listed last is still chosen', () {
+      final selector = BasePieceSelector();
+      final p0 = _FakePiece(0, peers: 8, subPieces: 4);
+      final p1 = _FakePiece(1, peers: 6, subPieces: 4);
+      final p2 = _FakePiece(2, peers: 1, subPieces: 4); // rarest, last
+      final provider = _FakePieceProvider({0: p0, 1: p1, 2: p2});
+      expect(selector.selectPiece('peerA', [0, 1, 2], provider), same(p2));
+      expect(selector.selectPiece('peerA', [0, 1, 2], provider, true),
+          same(p2));
+    });
+
+    test('tie on peers -> prefers the piece with fewer remaining sub pieces',
+        () {
+      final selector = BasePieceSelector();
+      // All equally rare (3 peers); p1 has the fewest sub pieces left.
+      final p0 = _FakePiece(0, peers: 3, subPieces: 5);
+      final p1 = _FakePiece(1, peers: 3, subPieces: 1);
+      final p2 = _FakePiece(2, peers: 3, subPieces: 4);
+      final provider = _FakePieceProvider({0: p0, 1: p1, 2: p2});
+      expect(selector.selectPiece('peerA', [0, 1, 2], provider), same(p1));
+    });
+
+    test('full tie (peers + sub pieces) is deterministic when random=false',
+        () {
+      final selector = BasePieceSelector();
+      final p0 = _FakePiece(0, peers: 3, subPieces: 4);
+      final p1 = _FakePiece(1, peers: 3, subPieces: 4);
+      final p2 = _FakePiece(2, peers: 3, subPieces: 4);
+      final provider = _FakePieceProvider({0: p0, 1: p1, 2: p2});
+      // Deterministic: the first fully-tied candidate, repeatable.
+      final first = selector.selectPiece('peerA', [0, 1, 2], provider);
+      expect(first, same(p0));
+      for (var i = 0; i < 20; i++) {
+        expect(selector.selectPiece('peerA', [0, 1, 2], provider), same(p0));
+      }
+    });
+
+    test('full tie with random=true stays within the tied candidates', () {
+      final selector = BasePieceSelector();
+      final p0 = _FakePiece(0, peers: 3, subPieces: 4);
+      final p1 = _FakePiece(1, peers: 3, subPieces: 4);
+      final p2 = _FakePiece(2, peers: 3, subPieces: 4);
+      // p3 is rarer; it must never be skipped in favour of a tie member,
+      // and the tied random pick must never leak a non-candidate.
+      final provider = _FakePieceProvider({0: p0, 1: p1, 2: p2});
+      final seen = <Piece?>{};
+      for (var i = 0; i < 50; i++) {
+        final picked =
+            selector.selectPiece('peerA', [0, 1, 2], provider, true);
+        expect([p0, p1, p2], contains(picked));
+        seen.add(picked);
+      }
+      // The random tie-break should exercise more than a single candidate.
+      expect(seen.length, greaterThan(1));
+    });
+
+    test('skips pieces unavailable to the peer when finding the rarest', () {
+      final selector = BasePieceSelector();
+      // The globally rarest piece (p0, 1 peer) is NOT available to peerA, so
+      // it must be ignored; among the peer's candidates p2 (3 peers) is rarest.
+      final p0 = _FakePiece(0, peers: 1, subPieces: 4, availableToPeer: false);
+      final p1 = _FakePiece(1, peers: 8, subPieces: 4);
+      final p2 = _FakePiece(2, peers: 3, subPieces: 4);
+      final provider = _FakePieceProvider({0: p0, 1: p1, 2: p2});
+      expect(selector.selectPiece('peerA', [0, 1, 2], provider), same(p2));
+    });
+
+    test('empty candidate set returns null', () {
+      final selector = BasePieceSelector();
+      final provider = _FakePieceProvider({});
+      expect(selector.selectPiece('peerA', <int>[], provider), isNull);
+      expect(selector.selectPiece('peerA', <int>[], provider, true), isNull);
+    });
   });
 
   group('Peer wire protocol round-trip over loopback TCP', () {
@@ -346,9 +437,14 @@ List<int> _asBytes(dynamic v) {
 class _FakePiece extends Piece {
   final int _peers;
   final int _subPieces;
-  _FakePiece(int index, {required int peers, required int subPieces})
+  final bool _availableToPeer;
+  _FakePiece(int index,
+      {required int peers,
+      required int subPieces,
+      bool availableToPeer = true})
       : _peers = peers,
         _subPieces = subPieces,
+        _availableToPeer = availableToPeer,
         super('hash$index', index, 16384, 16384);
 
   @override
@@ -361,7 +457,7 @@ class _FakePiece extends Piece {
   bool haveAvalidateSubPiece() => _subPieces > 0;
 
   @override
-  bool containsAvalidatePeer(String id) => _peers > 0;
+  bool containsAvalidatePeer(String id) => _availableToPeer && _peers > 0;
 }
 
 class _FakePieceProvider implements PieceProvider {
