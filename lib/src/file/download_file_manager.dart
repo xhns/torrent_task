@@ -105,6 +105,8 @@ class DownloadFileManager {
 
   int get downloaded => _stateFile.downloaded;
 
+  int get uploaded => _stateFile.uploaded;
+
   /// 该方法看似只将缓冲区内容写入磁盘，实际上
   /// 每当缓存写入后都会认为该[pieceIndex]对应`Piece`已经完成，则会去移除
   /// `_file2pieceMap`中文件对应的piece index，当全部移除完毕，会抛出File Complete事件

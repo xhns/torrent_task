@@ -55,6 +55,9 @@ abstract class TorrentTask {
   /// Downloaded total bytes length
   int? get downloaded;
 
+  /// Uploaded total bytes length (раздано — персистится в .bt.state)
+  int? get uploaded;
+
   /// Downloaded percent
   double get progress;
 
@@ -482,6 +485,9 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   @override
   int? get downloaded => _fileManager?.downloaded;
+
+  @override
+  int? get uploaded => _fileManager?.uploaded;
 
 
 
