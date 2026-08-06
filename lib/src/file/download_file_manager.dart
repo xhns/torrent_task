@@ -209,7 +209,15 @@ class DownloadFileManager {
     var ps = pieceIndex * metainfo.pieceLength! + begin;
     var pe = ps + length;
     if (tempFiles == null || tempFiles.isEmpty) return;
-    var futures = <Future>[];
+    // Порядок кусочков в собираемом блоке ОБЯЗАН совпадать с порядком файлов в
+    // торренте: блок склеивается из хвоста одного файла и головы следующего.
+    // Раньше здесь стоял `Stream.fromFutures(...).fold(...)`, а он отдаёт
+    // элементы в порядке ЗАВЕРШЕНИЯ чтений, а не в порядке списка. Файлы —
+    // независимые очереди операций: если очередь первого файла занята, его
+    // чтение завершается позже, и кусочки склеивались задом наперёд — пиру
+    // уезжал битый блок на каждом стыке файлов. `Future.wait` сохраняет
+    // порядок списка. Держится тестом test/file_boundary_test.dart.
+    var futures = <Future<List<int>>>[];
     for (var i = 0; i < tempFiles.length; i++) {
       var tempFile = tempFiles[i];
       var re = _mapDownloadFilePosition(ps, pe, length, tempFile);
@@ -217,12 +225,34 @@ class DownloadFileManager {
       var substart = re['begin'];
       var position = re['position'];
       var subend = re['end'];
+      if (subend <= substart) continue;
       futures.add(tempFile.requestRead(position, subend - substart));
     }
-    Stream.fromFutures(futures).fold<List<int>>(<int>[], (previous, element) {
-      if (element != null && element is List<int>) previous.addAll(element);
-      return previous;
-    }).then((re) => _subPieceReadComplete(pieceIndex, begin, re));
+    if (futures.isEmpty) return;
+    Future.wait(futures).then((parts) {
+      var block = <int>[];
+      for (var part in parts) {
+        block.addAll(part);
+      }
+      if (block.length != length) {
+        // Короткое чтение (файл обрезан/недоступен — `_read` отдаёт пустой
+        // список на ошибке). Отдать такой блок пиру нельзя: он запишет его как
+        // полноценный под-piece и получит дыру. Молчим — пир перезапросит.
+        log(
+          'Чтение блока ($pieceIndex, $begin, $length) отдало '
+          '${block.length} байт — блок не отправляем',
+          name: runtimeType.toString(),
+        );
+        return;
+      }
+      _subPieceReadComplete(pieceIndex, begin, block);
+    }, onError: (e) {
+      log(
+        'Ошибка чтения блока ($pieceIndex, $begin, $length)',
+        error: e,
+        name: runtimeType.toString(),
+      );
+    });
     return;
   }
 
@@ -271,9 +301,8 @@ class DownloadFileManager {
       _subPieceWriteFailed(pieceIndex, begin, blockSize);
       return;
     }
-    Stream.fromFutures(futures).fold<bool>(true, (p, a) {
-      return p && a;
-    }).then((result) {
+    Future.wait(futures).then((results) {
+      var result = results.every((ok) => ok);
       if (result) {
         _subPieceWriteComplete(pieceIndex, begin, blockSize);
       } else {
