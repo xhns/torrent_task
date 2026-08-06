@@ -128,6 +128,10 @@ abstract class Peer
   /// has this peer send handshake message already?
   bool _handShaked = false;
 
+  /// Получено ли рукопожатие ОТ собеседника. До него в потоке не может быть
+  /// ничего, кроме BitTorrent handshake.
+  bool _remoteHandShaked = false;
+
   /// has this peer send local bitfield to remote?
   bool _bitfieldSended = false;
 
@@ -318,6 +322,7 @@ abstract class Peer
     _disposeReason = null;
     _disposed = false;
     _handShaked = false;
+    _remoteHandShaked = false;
     // 清空通道数据缓存：
     _resetRecv();
     // 清空请求缓存
@@ -424,6 +429,43 @@ abstract class Peer
     if (data != null && data.isNotEmpty) _startToCountdown();
     if (data != null) _appendToRecv(data as List<int>); // буферизуем приём
     if (_recvAvailable == 0) return;
+    // Пока рукопожатия от собеседника не было, первым в потоке обязан идти
+    // BitTorrent handshake. Всё остальное — не наш протокол: чаще всего это
+    // MSE/PE (шифрованное рукопожатие), с которого aria2/qBittorrent начинают
+    // ИСХОДЯЩЕЕ подключение.
+    //
+    // Раньше такой поток молча проваливался в разбор сообщений, длина первого
+    // «сообщения» бралась из случайных байт DH-ключа, и соединение висело до
+    // 150-секундного таймаута тишины. Для инициатора это выглядит как
+    // «подключился и молчит»: aria2 переходит на открытое рукопожатие только
+    // по ОШИБКЕ сокета, а её не было — обмен вставал намертво. Замерено: за
+    // 100 секунд по входящему соединению не ушло ни байта, при том что то же
+    // самое aria2 качало на 10 МБ/с по соединению, которое инициировали мы.
+    //
+    // Закрываемся сразу: инициатор получает ошибку и тут же повторяет попытку
+    // в открытом виде — этот путь у него штатный.
+    // Покрыто: test/handshake_validation_test.dart.
+    if (!_remoteHandShaked) {
+      var check = _recvAvailable < HAND_SHAKE_HEAD.length
+          ? _recvAvailable
+          : HAND_SHAKE_HEAD.length;
+      for (var i = 0; i < check; i++) {
+        if (_recvByte(i) != HAND_SHAKE_HEAD[i]) {
+          dispose(BadException(
+              '$address : поток начинается не с BitTorrent handshake '
+              '(вероятно MSE/PE), закрываем — пусть повторит открытым'));
+          return;
+        }
+      }
+      // Сигнатура пока совпадает, но рукопожатие ещё не целиком — ждём добора.
+      //
+      // Явный выход, а не необходимость: без него поток ушёл бы в разбор
+      // сообщений ниже, где длина первого «сообщения» вышла бы равной
+      // 0x13426974 и цикл всё равно ничего бы не потребил. То есть снятие этой
+      // строки поведения не меняет — мутация по ней эквивалентная, тестом она
+      // и не может быть поймана.
+      if (_recvAvailable < 68) return;
+    }
     // 查看是不是handshake头
     if (_recvByte(0) == 19 && _recvAvailable >= 68) {
       if (_isHandShakeHeadAt()) {
@@ -431,6 +473,7 @@ abstract class Peer
           var handshakeBuffer = Uint8List(68);
           handshakeBuffer.setRange(0, 68, _recvBuf, _recvStart);
           _consumeRecv(68);
+          _remoteHandShaked = true;
           Timer.run(() => _processHandShake(handshakeBuffer));
           // Остаток разбираем тем же проходом ниже (без повторного Timer.run-входа).
         } else {
@@ -1241,6 +1284,7 @@ abstract class Peer
     _disposeReason = reason;
     _disposed = true;
     _handShaked = false;
+    _remoteHandShaked = false;
     _bitfieldSended = false;
     fireDisposeEvent(reason);
     clearEventHandles();
