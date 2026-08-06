@@ -608,11 +608,8 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _lsd?.port = _serverSocket!.port;
     _lsd?.start();
 
-    // DHT анонсирует внешний порт по той же причине, что и трекер. LSD выше —
-    // наоборот локальный: он живёт в пределах широковещательного домена, и
-    // внешний порт соседу по Wi-Fi бесполезен.
-    _dht?.announce(String.fromCharCodes(_metaInfo!.infoHashBuffer!),
-        _mappingStatus.externalTcpPort ?? _serverSocket!.port);
+    _dht?.announce(
+        String.fromCharCodes(_metaInfo!.infoHashBuffer!), _announcePort!);
     _dht?.onNewPeer(_processDHTPeer);
     // ignore: unawaited_futures
     _dht?.bootstrap();
@@ -655,6 +652,23 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
       log('проброс порта не удался: $e', name: runtimeType.toString());
     }
   }
+
+  /// Порт, который мы сообщаем сварму, — ЕДИНСТВЕННЫЙ источник для трекера и
+  /// DHT.
+  ///
+  /// Это внешний порт, если он получен: на живом роутере запрос внутреннего
+  /// 51413 вернул внешний 51414, и анонс локального номера отправил бы весь
+  /// сварм стучаться в закрытую дверь. Маппинг приходит асинхронно, поэтому
+  /// читается состояние на момент анонса, а не снимок со старта.
+  ///
+  /// LSD сюда НЕ ходит намеренно: он живёт в пределах широковещательного
+  /// домена, и внешний порт соседу по Wi-Fi бесполезен.
+  ///
+  /// Один геттер на обоих потребителей — чтобы «трекер и DHT анонсируют одно и
+  /// то же» держалось кодом, а не внимательностью.
+  /// Покрыто (через трекер): test/announce_external_port_test.dart.
+  int? get _announcePort =>
+      _mappingStatus.externalTcpPort ?? _serverSocket?.port;
 
   @override
   Reachability get reachability {
@@ -756,12 +770,7 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
       'numwant': 50,
       'compact': 1,
       'peerId': _peerId,
-      // Анонсируем ВНЕШНИЙ порт, если он есть: на домашнем стенде запрос
-      // внутреннего 51413 вернул внешний 51414, и анонс локального номера
-      // отправил бы весь сварм стучаться в закрытую дверь. Маппинг приходит
-      // асинхронно, поэтому здесь читается актуальное состояние на момент
-      // анонса, а не снимок со старта.
-      'port': _mappingStatus.externalTcpPort ?? _serverSocket?.port
+      'port': _announcePort
     };
     return Future.value(map);
   }
