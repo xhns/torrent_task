@@ -39,7 +39,8 @@ void main() {
       );
       infoHash = model.infoHashBuffer!;
       await writeFiles(tmp, model, files);
-      task = TorrentTask.newTask(model, tmp.path);
+      task = TorrentTask.newTask(model, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       await task.recheck();
       final map = await task.start();
       seedPort = map['tcp_socket'] as int;

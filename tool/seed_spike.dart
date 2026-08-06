@@ -10,6 +10,7 @@
 //
 // Usage:
 //   dart tool/seed_spike.dart <torrentFile> <savePath> [--no-dht] [--seconds N]
+//       [--port N] [--no-mapping] [--no-utp]
 import 'dart:async';
 import 'dart:io';
 
@@ -29,7 +30,8 @@ void log(String msg) => print('[${_ts()}] $msg');
 
 Future<void> main(List<String> args) async {
   if (args.length < 2) {
-    stderr.writeln('usage: seed_spike.dart <torrent> <savePath> [--seconds N]');
+    stderr.writeln('usage: seed_spike.dart <torrent> <savePath> '
+        '[--seconds N] [--port N] [--no-mapping] [--no-utp]');
     exit(64);
   }
   final torrentFile = args[0];
@@ -42,12 +44,23 @@ Future<void> main(List<String> args) async {
   // seeder never announces at all. --force-announce re-adds the announce via
   // the public startAnnounceUrl(), which does go through runTracker().
   var forceAnnounce = false;
+  // Слушающий порт и автопроброс — параметры стенда: два стенда на одной
+  // машине обязаны разъехаться по портам, а прогон в чужой сети не должен
+  // молча ставить маппинг на чужой роутер.
+  var listenPort = kDefaultListenPort;
+  var mapping = true;
+  var enableUtp = true;
   final extraTrackers = <Uri>[];
   final directPeers = <CompactAddress>[];
   for (var i = 2; i < args.length; i++) {
     if (args[i] == '--seconds' && i + 1 < args.length) {
       seconds = int.parse(args[i + 1]);
     }
+    if (args[i] == '--port' && i + 1 < args.length) {
+      listenPort = int.parse(args[i + 1]);
+    }
+    if (args[i] == '--no-mapping') mapping = false;
+    if (args[i] == '--no-utp') enableUtp = false;
     if (args[i] == '--force-announce') forceAnnounce = true;
     if (args[i] == '--extra-tracker' && i + 1 < args.length) {
       extraTrackers.add(Uri.parse(args[i + 1]));
@@ -69,7 +82,8 @@ Future<void> main(List<String> args) async {
       'pieceLength=${model.pieceLength}');
   log('announces : ${model.announces}');
 
-  final task = TorrentTask.newTask(model, savePath);
+  final task = TorrentTask.newTask(model, savePath,
+      listenPort: listenPort, enableUtp: enableUtp, enablePortMapping: mapping);
 
   log('--- recheck: verifying files already on disk ---');
   final verified = await task.recheck();

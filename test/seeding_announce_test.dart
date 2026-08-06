@@ -37,7 +37,8 @@ void main() {
       );
       await writeFiles(tmp, model, files);
 
-      final task = TorrentTask.newTask(model, tmp.path);
+      final task = TorrentTask.newTask(model, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       final verified = await task.recheck();
 
       // ПРЕДУСЛОВИЕ. Тест проверяет поведение ветки «торрент уже полон»; если
@@ -76,7 +77,8 @@ void main() {
       );
       await writeFiles(tmp, model, files);
 
-      final task = TorrentTask.newTask(model, tmp.path);
+      final task = TorrentTask.newTask(model, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       final verified = await task.recheck();
       expect(verified, equals(model.pieces.length),
           reason: 'предусловие: торрент полон на старте');

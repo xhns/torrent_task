@@ -48,7 +48,8 @@ void main() {
     final leechDir = Directory(p.join(tmp.path, 'leech'))..createSync();
     await writeFiles(seedDir, model, files);
 
-    final seed = TorrentTask.newTask(model, seedDir.path);
+    final seed = TorrentTask.newTask(model, seedDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
     final seedVerified = await seed.recheck();
     // ПРЕДУСЛОВИЕ: сиду есть что отдавать.
     expect(seedVerified, equals(model.pieces.length),
@@ -57,7 +58,8 @@ void main() {
     addTearDown(seed.stop);
     final seedPort = seedMap['tcp_socket'] as int;
 
-    final leech = TorrentTask.newTask(model, leechDir.path);
+    final leech = TorrentTask.newTask(model, leechDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
     final leechVerified = await leech.recheck();
     // ПРЕДУСЛОВИЕ: качающему действительно нужно качать, иначе тест прошёл бы
     // по пути «всё уже на месте» и ничего бы не проверил.
@@ -144,12 +146,14 @@ void main() {
     final leechDir = Directory(p.join(tmp.path, 'leech'))..createSync();
     await writeFiles(seedDir, model, files);
 
-    final seed = TorrentTask.newTask(model, seedDir.path);
+    final seed = TorrentTask.newTask(model, seedDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
     expect(await seed.recheck(), equals(model.pieces.length));
     final seedMap = await seed.start();
     addTearDown(seed.stop);
 
-    final leech = TorrentTask.newTask(model, leechDir.path);
+    final leech = TorrentTask.newTask(model, leechDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
     expect(await leech.recheck(), equals(0));
     await leech.start();
     addTearDown(leech.stop);

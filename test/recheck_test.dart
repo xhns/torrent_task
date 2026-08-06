@@ -261,7 +261,8 @@ void main() {
           name: 'donebook', pieceLength: pieceLen, files: files);
       await _writeFiles(tmp, t, files);
 
-      final task = TorrentTask.newTask(t, tmp.path);
+      final task = TorrentTask.newTask(t, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       final verified = await task.recheck();
       expect(verified, equals(t.pieces.length));
 
@@ -283,7 +284,8 @@ void main() {
           name: 'partial', pieceLength: pieceLen, files: files);
       await _writeFiles(tmp, t, [files[0]]); // only a.bin
 
-      final task = TorrentTask.newTask(t, tmp.path);
+      final task = TorrentTask.newTask(t, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       final verified = await task.recheck();
       expect(verified, equals(1));
 

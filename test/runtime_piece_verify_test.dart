@@ -261,7 +261,8 @@ void main() {
       final leechDir = Directory(p.join(tmp.path, 'leech'))..createSync();
       await writeFiles(seedDir, model, files);
 
-      final seed = TorrentTask.newTask(model, seedDir.path);
+      final seed = TorrentTask.newTask(model, seedDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       // Сид проверяет ЦЕЛЫЕ файлы и объявляет себя полным...
       expect(await seed.recheck(), equals(model.pieces.length),
           reason: 'предусловие: сид полон на момент recheck');
@@ -281,7 +282,8 @@ void main() {
       expect(await seedFile.length(), equals(lengthBefore),
           reason: 'предусловие: порча не меняет длину файла');
 
-      final leech = TorrentTask.newTask(model, leechDir.path);
+      final leech = TorrentTask.newTask(model, leechDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       expect(await leech.recheck(), equals(0),
           reason: 'предусловие: качающему нужно качать всё');
       await leech.start();
@@ -350,12 +352,14 @@ void main() {
       await writeFiles(goodDir, model, files);
       await writeFiles(badDir, model, files);
 
-      final good = TorrentTask.newTask(model, goodDir.path);
+      final good = TorrentTask.newTask(model, goodDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       expect(await good.recheck(), equals(model.pieces.length));
       final goodMap = await good.start();
       addTearDown(good.stop);
 
-      final bad = TorrentTask.newTask(model, badDir.path);
+      final bad = TorrentTask.newTask(model, badDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       expect(await bad.recheck(), equals(model.pieces.length));
       final badMap = await bad.start();
       addTearDown(bad.stop);
@@ -368,7 +372,8 @@ void main() {
       await raf.flush();
       await raf.close();
 
-      final leech = TorrentTask.newTask(model, leechDir.path);
+      final leech = TorrentTask.newTask(model, leechDir.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       expect(await leech.recheck(), equals(0));
       await leech.start();
       addTearDown(leech.stop);

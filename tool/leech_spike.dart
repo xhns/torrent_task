@@ -9,6 +9,7 @@
 // Запуск:
 //   dart tool/leech_spike.dart <torrentFile> <savePath> --peer host:port \
 //       [--peer host:port] [--seconds N] [--no-recheck-at-end]
+//       [--port N] [--no-mapping] [--utp]
 import 'dart:async';
 import 'dart:io';
 
@@ -30,19 +31,30 @@ Future<void> main(List<String> args) async {
   if (args.length < 2) {
     stderr.writeln(
         'usage: leech_spike.dart <torrent> <savePath> --peer host:port '
-        '[--seconds N]');
+        '[--seconds N] [--port N] [--no-mapping] [--utp]');
     exit(64);
   }
   final torrentFile = args[0];
   final savePath = args[1];
   var seconds = 600;
   var recheckAtEnd = true;
+  var listenPort = kDefaultListenPort;
+  var mapping = true;
+  // --utp заставляет ходить к заданным пирам по uTP вместо TCP: единственный
+  // способ проверить uTP-путь целиком, не полагаясь на то, что удалённый
+  // клиент сам его предложит.
+  var peerType = PeerType.TCP;
   final directPeers = <CompactAddress>[];
   for (var i = 2; i < args.length; i++) {
     if (args[i] == '--seconds' && i + 1 < args.length) {
       seconds = int.parse(args[i + 1]);
     }
     if (args[i] == '--no-recheck-at-end') recheckAtEnd = false;
+    if (args[i] == '--port' && i + 1 < args.length) {
+      listenPort = int.parse(args[i + 1]);
+    }
+    if (args[i] == '--no-mapping') mapping = false;
+    if (args[i] == '--utp') peerType = PeerType.UTP;
     if (args[i] == '--peer' && i + 1 < args.length) {
       final parts = args[i + 1].split(':');
       directPeers
@@ -55,7 +67,8 @@ Future<void> main(List<String> args) async {
   log('length    : ${model.length} bytes, pieces=${model.pieces.length} '
       'pieceLength=${model.pieceLength}');
 
-  final task = TorrentTask.newTask(model, savePath);
+  final task = TorrentTask.newTask(model, savePath,
+      listenPort: listenPort, enablePortMapping: mapping);
   final verified = await task.recheck();
   log('recheck   : $verified / ${model.pieces.length} кусков уже на диске');
 
@@ -69,8 +82,8 @@ Future<void> main(List<String> args) async {
   final map = await task.start();
   log('start()   : port=${map['tcp_socket']} downloaded=${map['downloaded']}');
   for (final p in directPeers) {
-    log('PEER -> $p');
-    task.addPeer(p);
+    log('PEER -> $p (${peerType.name})');
+    task.addPeer(p, peerType);
   }
 
   var lastDownloaded = 0;
