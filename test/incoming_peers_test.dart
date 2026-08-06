@@ -40,7 +40,8 @@ void main() {
       infoHash = model.infoHashBuffer!;
       await writeFiles(tmp, model, files);
 
-      task = TorrentTask.newTask(model, tmp.path);
+      task = TorrentTask.newTask(model, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       final verified = await task.recheck();
       expect(verified, equals(model.pieces.length),
           reason: 'предусловие: сид полон, ему есть что раздавать');

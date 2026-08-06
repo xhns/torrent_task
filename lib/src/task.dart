@@ -7,12 +7,15 @@ import 'package:torrent_model/torrent_model.dart';
 import 'package:torrent_tracker/torrent_tracker.dart';
 import 'package:dartorrent_common/dartorrent_common.dart';
 import 'package:dht_dart/dht_dart.dart';
+import 'package:utp/utp.dart';
 
 import 'file/download_file_manager.dart';
 import 'file/piece_verifier.dart';
 import 'file/recheck.dart';
 import 'file/state_file.dart';
 import 'lsd/lsd.dart';
+import 'nat/port_mapper.dart';
+import 'nat/reachability.dart';
 import 'peer/peer.dart';
 import 'piece/base_piece_selector.dart';
 import 'piece/piece_manager.dart';
@@ -21,11 +24,64 @@ import 'utils.dart';
 
 const MAX_PEERS = 50;
 
+/// Слушающий порт по умолчанию.
+///
+/// Эфемерный порт (`0`), стоявший здесь раньше, делал клиент принципиально
+/// недостижимым: он менялся при каждом запуске, поэтому ни ручной проброс на
+/// роутере, ни устойчивый маппинг были невозможны в принципе. 51413 —
+/// общепринятый BitTorrent-порт (его же по умолчанию берёт Transmission),
+/// поэтому пользователю, пробрасывающему порт руками, не нужно ничего
+/// выяснять.
+///
+/// Приложению правильнее выбрать порт ОДИН РАЗ (например случайный из
+/// 49152–65535, чтобы не попадать под шейпинг известного 51413) и хранить его
+/// в своих настройках, передавая сюда при каждом запуске: движок хранением не
+/// занимается, ему нужен только параметр.
+const int kDefaultListenPort = 51413;
+
+/// Значение [kDefaultListenPort]-параметра, означающее «дай любой свободный».
+const int kEphemeralListenPort = 0;
+
 abstract class TorrentTask {
-  factory TorrentTask.newTask(Torrent metaInfo, String savePath) {
-    return _TorrentTask(metaInfo, savePath);
+  /// [listenPort] — порт, на котором задача слушает входящие TCP и uTP.
+  /// [kEphemeralListenPort] (`0`) даёт случайный порт и заведомо недостижимый
+  /// снаружи клиент — это осознанный выбор для тестов, не для приложения.
+  /// Если порт занят, задача откатывается на эфемерный (см. [reachability]).
+  ///
+  /// [enableUtp] включает приём входящих uTP на том же номере порта, но по
+  /// UDP. [enablePortMapping] разрешает задаче самой пробить порт на роутере
+  /// (UPnP IGD / NAT-PMP / PCP).
+  ///
+  /// [portMapper] позволяет подменить пробиватель порта — нужно тестам, чтобы
+  /// не ходить в настоящую сеть.
+  factory TorrentTask.newTask(
+    Torrent metaInfo,
+    String savePath, {
+    int listenPort = kDefaultListenPort,
+    bool enableUtp = true,
+    bool enablePortMapping = true,
+    PortMapper? portMapper,
+  }) {
+    return _TorrentTask(metaInfo, savePath,
+        listenPort: listenPort,
+        enableUtp: enableUtp,
+        enablePortMapping: enablePortMapping,
+        portMapper: portMapper);
   }
   void startAnnounceUrl(Uri url, Uint8List infoHash);
+
+  /// Достижима ли наша раздача извне: слушающий порт, внешние адрес/порт и
+  /// способ, которым они получены, и сколько ВХОДЯЩИХ соединений принято.
+  ///
+  /// Приложение показывает это в настройках. Без такой сводки «0 роздано»
+  /// неотличимо от «раздаю, но никто не качает».
+  Reachability get reachability;
+
+  /// Подписаться на изменения [reachability] (маппинг получен/потерян/продлён,
+  /// принято первое входящее соединение).
+  bool onReachability(void Function(Reachability status) handler);
+
+  bool offReachability(void Function(Reachability status) handler);
 
   int get allPeersNumber;
 
@@ -151,6 +207,8 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   final Set<void Function()> _pauseHandlers = {};
 
+  final Set<void Function(Reachability status)> _reachabilityHandlers = {};
+
   TorrentAnnounceTracker? _tracker;
 
   DHT? _dht;
@@ -177,9 +235,39 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   ServerSocket? _serverSocket;
 
+  ServerUTPSocket? _utpServer;
+
   bool _paused = false;
 
-  _TorrentTask(this._metaInfo, this._savePath) {
+  /// Порт, который у нас попросили. Фактический может отличаться — см.
+  /// [_bindListener].
+  final int _configuredPort;
+
+  final bool _enableUtp;
+
+  final bool _enablePortMapping;
+
+  PortMapper? _portMapper;
+
+  StreamSubscription<PortMapperStatus>? _portMapperSub;
+
+  PortMapperStatus _mappingStatus = const PortMapperStatus();
+
+  int _incomingTcpCount = 0;
+  int _incomingUtpCount = 0;
+  int _incomingWanCount = 0;
+
+  _TorrentTask(
+    this._metaInfo,
+    this._savePath, {
+    int listenPort = kDefaultListenPort,
+    bool enableUtp = true,
+    bool enablePortMapping = true,
+    PortMapper? portMapper,
+  })  : _configuredPort = listenPort,
+        _enableUtp = enableUtp,
+        _enablePortMapping = enablePortMapping,
+        _portMapper = portMapper {
     _peerId = generatePeerId();
   }
 
@@ -346,10 +434,53 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     // Лимит входящих переехал в PeersManager: там адрес освобождается, когда
     // пир отваливается.
     // Покрыто: test/incoming_peers_test.dart.
+    _countIncoming(socket.remoteAddress, PeerType.TCP);
     _peersManager?.addNewPeerAddress(
         CompactAddress(socket.remoteAddress, socket.remotePort),
         PeerType.TCP,
         socket);
+  }
+
+  /// Входящее uTP-соединение.
+  ///
+  /// Раньше и `ServerUTPSocket.bind`, и этот обработчик были закомментированы:
+  /// исходящий uTP работал, входящий — нет. Для пользователя за NAT это
+  /// половина шансов: у части роутеров UDP проходит там, где TCP-соединение
+  /// не устанавливается.
+  ///
+  /// Дальше входящий uTP-пир ничем не отличается от входящего TCP: `UTPSocket`
+  /// реализует `Socket`, а [PeersManager.addNewPeerAddress] с готовым сокетом
+  /// сам заводит пира как принятого (`incoming: true`).
+  /// Покрыто: test/incoming_utp_test.dart.
+  void _hookUTP(UTPSocket socket) {
+    // Тот же запрет на соединение с самим собой, что и в [_hookInPeer].
+    if (socket.remoteAddress == LOCAL_ADDRESS) {
+      socket.close();
+      return;
+    }
+    log('incoming uTP connect: '
+        '${socket.remoteAddress.address}:${socket.remotePort}',
+        name: runtimeType.toString());
+    _countIncoming(socket.remoteAddress, PeerType.UTP);
+    _peersManager?.addNewPeerAddress(
+        CompactAddress(socket.remoteAddress, socket.remotePort),
+        PeerType.UTP,
+        socket);
+  }
+
+  /// Учёт входящих для диагностики достижимости.
+  ///
+  /// Соединения из локальной сети считаются отдельно: сосед по Wi-Fi, нашедший
+  /// нас через LSD, ничего не доказывает о проходимости NAT, а входящее с
+  /// публичного адреса — доказывает.
+  void _countIncoming(InternetAddress remote, PeerType type) {
+    if (type == PeerType.UTP) {
+      _incomingUtpCount++;
+    } else {
+      _incomingTcpCount++;
+    }
+    if (!isPrivateAddress(remote)) _incomingWanCount++;
+    _fireReachabilityChanged();
   }
 
   @override
@@ -394,19 +525,75 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     return result.verifiedPieces;
   }
 
+  /// Занять слушающий TCP-порт.
+  ///
+  /// Занятый порт — не повод падать: клиент с эфемерным портом всё ещё качает
+  /// и раздаёт исходящими соединениями, просто снаружи его не найти. Об этом
+  /// честно сообщает [reachability] (`listeningOnConfiguredPort == false`).
+  /// Покрыто: test/listen_port_test.dart.
+  Future<ServerSocket> _bindListener() async {
+    if (_configuredPort != kEphemeralListenPort) {
+      try {
+        return await ServerSocket.bind(InternetAddress.anyIPv4, _configuredPort);
+      } on SocketException catch (e) {
+        log(
+            'слушающий порт $_configuredPort занят ($e) — берём эфемерный. '
+            'Ручной проброс на $_configuredPort работать не будет',
+            name: runtimeType.toString());
+      }
+    }
+    return await ServerSocket.bind(
+        InternetAddress.anyIPv4, kEphemeralListenPort);
+  }
+
+  /// Занять UDP-порт под входящий uTP.
+  ///
+  /// Номер тот же, что у TCP, — так делают все клиенты, и так один проброс на
+  /// роутере закрывает оба транспорта. DHT в этом стеке слушает собственный
+  /// фиксированный UDP 6881 (см. `dht_dart`), поэтому конфликта с ним нет,
+  /// пока слушающий порт не выставлен в 6881 вручную.
+  ///
+  /// `reuseAddress: false` здесь обязателен. UDP-сокет с `SO_REUSEADDR`
+  /// (умолчание Dart) встаёт на УЖЕ занятый чужим процессом адрес без всякой
+  /// ошибки, после чего входящие датаграммы достаются только одному из двух
+  /// сокетов: слушатель выглядел бы совершенно здоровым, не принимая при этом
+  /// ничего. С выключенным reuse конфликт честно приходит исключением, и мы
+  /// откатываемся на эфемерный порт — без проброса, но рабочий.
+  /// Покрыто: test/listen_port_test.dart.
+  Future<ServerUTPSocket?> _bindUtp(int port) async {
+    try {
+      return await ServerUTPSocket.bind(InternetAddress.anyIPv4, port, false);
+    } catch (e) {
+      log('UDP $port под uTP занят ($e) — пробуем эфемерный',
+          name: runtimeType.toString());
+    }
+    try {
+      return await ServerUTPSocket.bind(
+          InternetAddress.anyIPv4, kEphemeralListenPort, false);
+    } catch (e) {
+      // uTP — не единственный транспорт: без него остаётся TCP.
+      log('не удалось поднять приём uTP: $e', name: runtimeType.toString());
+      return null;
+    }
+  }
+
   @override
   Future start() async {
     // 进入的peer：
-    _serverSocket ??= await ServerSocket.bind(InternetAddress.anyIPv4, 0);
+    _serverSocket ??= await _bindListener();
     await _init(_metaInfo!, _savePath);
     _serverSocket?.listen(_hookInPeer);
-    // _utpServer ??= await ServerUTPSocket.bind(InternetAddress.anyIPv4, 0);
-    // _utpServer.listen(_hookUTP);
-    // print(_utpServer.port);
+    if (_enableUtp) {
+      _utpServer ??= await _bindUtp(_serverSocket!.port);
+      _utpServer?.listen(_hookUTP);
+    }
+    // ignore: unawaited_futures
+    _startPortMapping();
 
     var map = {};
     map['name'] = _metaInfo!.name;
     map['tcp_socket'] = _serverSocket!.port;
+    map['utp_socket'] = _utpServer?.port ?? 0;
     map['comoplete_pieces'] = List.from(_stateFile!.bitfield.completedPieces);
     map['total_pieces_num'] = _stateFile!.bitfield.piecesNum;
     map['downloaded'] = _stateFile!.downloaded;
@@ -421,8 +608,11 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _lsd?.port = _serverSocket!.port;
     _lsd?.start();
 
-    _dht?.announce(
-        String.fromCharCodes(_metaInfo!.infoHashBuffer!), _serverSocket!.port);
+    // DHT анонсирует внешний порт по той же причине, что и трекер. LSD выше —
+    // наоборот локальный: он живёт в пределах широковещательного домена, и
+    // внешний порт соседу по Wi-Fi бесполезен.
+    _dht?.announce(String.fromCharCodes(_metaInfo!.infoHashBuffer!),
+        _mappingStatus.externalTcpPort ?? _serverSocket!.port);
     _dht?.onNewPeer(_processDHTPeer);
     // ignore: unawaited_futures
     _dht?.bootstrap();
@@ -441,6 +631,64 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _tracker?.runTrackers(_metaInfo!.announces, _metaInfo!.infoHashBuffer!,
         event: EVENT_STARTED);
     return map;
+  }
+
+  /// Пробить слушающий порт на роутере.
+  ///
+  /// Запускается «в фоне» намеренно: discovery UPnP — это мультикаст с
+  /// ожиданием ответов, и держать на нём `start()` (а с ним и UI приложения)
+  /// нельзя. До того как маппинг получен, задача уже работает — просто пока
+  /// без внешнего порта.
+  Future<void> _startPortMapping() async {
+    if (!_enablePortMapping) return;
+    final port = _serverSocket?.port;
+    if (port == null) return;
+    final mapper = _portMapper ??= PortMapper();
+    _portMapperSub ??= mapper.onStatus.listen((status) {
+      _mappingStatus = status;
+      _fireReachabilityChanged();
+    });
+    try {
+      // Оба протокола: TCP — обычные пиры, UDP — входящий uTP.
+      await mapper.map(internalPort: port);
+    } catch (e) {
+      log('проброс порта не удался: $e', name: runtimeType.toString());
+    }
+  }
+
+  @override
+  Reachability get reachability {
+    final status = _mappingStatus;
+    return Reachability(
+      configuredPort: _configuredPort,
+      listenPort: _serverSocket?.port ?? 0,
+      utpPort: _utpServer?.port ?? 0,
+      mappingMethod: status.method,
+      externalAddress: status.externalAddress,
+      externalTcpPort: status.externalTcpPort,
+      externalUdpPort: status.externalUdpPort,
+      mappingExpiresAt: status.expiresAt,
+      mappingError: status.error,
+      incomingTcpConnections: _incomingTcpCount,
+      incomingUtpConnections: _incomingUtpCount,
+      incomingFromWanConnections: _incomingWanCount,
+    );
+  }
+
+  @override
+  bool onReachability(void Function(Reachability status) handler) =>
+      _reachabilityHandlers.add(handler);
+
+  @override
+  bool offReachability(void Function(Reachability status) handler) =>
+      _reachabilityHandlers.remove(handler);
+
+  void _fireReachabilityChanged() {
+    if (_reachabilityHandlers.isEmpty) return;
+    final snapshot = reachability;
+    for (var handler in _reachabilityHandlers) {
+      Timer.run(() => handler(snapshot));
+    }
   }
 
   @override
@@ -463,6 +711,15 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _pauseHandlers.clear();
     _resumeHandlers.clear();
     _stopHandlers.clear();
+    _reachabilityHandlers.clear();
+    // Маппинг снимаем ДО закрытия сокетов: аренда на роутере живёт своим
+    // сроком и, если её не снять, порт останется висеть проброшенным на
+    // машину, которая его больше не слушает.
+    await _portMapperSub?.cancel();
+    _portMapperSub = null;
+    await _portMapper?.dispose();
+    _portMapper = null;
+    _mappingStatus = const PortMapperStatus();
     _tracker?.offPeerEvent(_processTrackerPeerEvent);
     _peersManager?.offAllComplete(_whenTaskDownloadComplete);
     _fileManager?.offFileComplete(_whenFileDownloadComplete);
@@ -473,6 +730,8 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _peersManager = null;
     await _serverSocket?.close();
     _serverSocket = null;
+    await _utpServer?.close();
+    _utpServer = null;
     await _fileManager?.close();
     _fileManager = null;
     // Изолят-хэшер держит собственные read-хэндлы на файлы книги — гасим его
@@ -497,7 +756,12 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
       'numwant': 50,
       'compact': 1,
       'peerId': _peerId,
-      'port': _serverSocket?.port
+      // Анонсируем ВНЕШНИЙ порт, если он есть: на домашнем стенде запрос
+      // внутреннего 51413 вернул внешний 51414, и анонс локального номера
+      // отправил бы весь сварм стучаться в закрытую дверь. Маппинг приходит
+      // асинхронно, поэтому здесь читается актуальное состояние на момент
+      // анонса, а не снимок со старта.
+      'port': _mappingStatus.externalTcpPort ?? _serverSocket?.port
     };
     return Future.value(map);
   }

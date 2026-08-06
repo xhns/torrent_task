@@ -144,7 +144,8 @@ void main() {
         }, onError: (_) {}, onDone: () {});
       });
 
-      final task = TorrentTask.newTask(model, tmp.path);
+      final task = TorrentTask.newTask(model, tmp.path,
+        listenPort: kEphemeralListenPort, enablePortMapping: false);
       await task.recheck();
       final map = await task.start();
       addTearDown(task.stop);
