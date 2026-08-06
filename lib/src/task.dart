@@ -244,11 +244,28 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   }
 
   /// Возобновить периодический анонс по всем announce-url торрента.
+  ///
+  /// Каждый url — отдельно и под защитой: `Tracker.restart()` БРОСАЕТ на уже
+  /// выброшенном трекере, а выброшен он к этому моменту запросто —
+  /// `Tracker.complete()` сам делает `dispose(e)`, если не достучался до
+  /// трекера. Вызывают нас из `void ... async`-обработчика, поэтому исключение
+  /// отсюда становится unhandled и роняет процесс целиком: на живом стенде
+  /// качающий с недоступным трекером умирал ровно в момент завершения загрузки,
+  /// не дописав файлы на диск.
+  ///
+  /// Недоступный трекер — не причина падать: раздача живёт и на LSD/DHT/PEX и
+  /// на уже известных пирах.
+  /// Покрыто: test/download_then_seed_test.dart.
   void _restartTrackerAnnounces() {
     final tracker = _tracker;
     if (tracker == null) return;
     for (var url in _metaInfo!.announces) {
-      tracker.restartTracker(url);
+      try {
+        tracker.restartTracker(url);
+      } catch (e) {
+        log('не удалось возобновить анонсы на $url: $e',
+            name: runtimeType.toString());
+      }
     }
   }
 
