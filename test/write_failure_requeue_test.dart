@@ -96,7 +96,8 @@ void main() {
       );
       final bitfield = Bitfield.createEmptyBitfield(metaInfo.pieces.length);
       final pm = PieceManager.createPieceManager(
-          BasePieceSelector(), metaInfo, bitfield);
+          BasePieceSelector(), metaInfo, bitfield,
+          verifier: null);
 
       final piece = pm[1]!;
       piece.subPieceDownloadComplete(DEFAULT_REQUEST_LENGTH);
@@ -117,7 +118,8 @@ void main() {
       );
       final bitfield = Bitfield.createEmptyBitfield(metaInfo.pieces.length);
       final pm = PieceManager.createPieceManager(
-          BasePieceSelector(), metaInfo, bitfield);
+          BasePieceSelector(), metaInfo, bitfield,
+          verifier: null);
       expect(pm.processSubPieceWriteFailed(999, 0, DEFAULT_REQUEST_LENGTH),
           isFalse);
     });

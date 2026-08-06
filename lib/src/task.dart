@@ -9,6 +9,7 @@ import 'package:dartorrent_common/dartorrent_common.dart';
 import 'package:dht_dart/dht_dart.dart';
 
 import 'file/download_file_manager.dart';
+import 'file/piece_verifier.dart';
 import 'file/recheck.dart';
 import 'file/state_file.dart';
 import 'lsd/lsd.dart';
@@ -59,6 +60,17 @@ abstract class TorrentTask {
 
   /// Downloaded percent
   double get progress;
+
+  /// Сколько кусков забраковала рантайм-проверка SHA1 за жизнь задачи.
+  ///
+  /// Каждая единица — кусок, который собрался целиком, но не сошёлся с хэшем из
+  /// metainfo: он не попал в bitfield и был перекачан заново. Устойчиво
+  /// растущий счётчик означает, что в рое есть источник с испорченной копией.
+  int get corruptedPiecesCount;
+
+  /// Пиры, отключённые за битые куски (`адрес:порт`), — к ним задача больше не
+  /// подключается.
+  Set<String> get bannedPeerIds;
 
   /// Force re-verify the files already present on disk against the torrent's
   /// piece hashes, rebuilding (and persisting) the local bitfield.
@@ -149,6 +161,8 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   PieceManager? _pieceManager;
 
+  IsolatePieceVerifier? _pieceVerifier;
+
   DownloadFileManager? _fileManager;
 
   PeersManager? _peersManager;
@@ -215,8 +229,12 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _infoHashString = String.fromCharCodes(model.infoHashBuffer as Iterable<int>);
     _tracker ??= TorrentAnnounceTracker(this);
     _stateFile ??= await StateFile.getStateFile(savePath, model);
+    // Хэш каждого докачанного куска считается в отдельном изоляте: у книги на
+    // 3 ГБ кусков тысячи, а SHA1 в главном изоляте дёргал бы UI приложения.
+    _pieceVerifier ??= await IsolatePieceVerifier.spawn(model, savePath);
     _pieceManager ??= PieceManager.createPieceManager(
-        BasePieceSelector(), model, _stateFile!.bitfield);
+        BasePieceSelector(), model, _stateFile!.bitfield,
+        verifier: _pieceVerifier);
     _fileManager ??= await DownloadFileManager.createFileManager(
         model, savePath, _stateFile!);
     _peersManager ??= PeersManager(_peerId!, _pieceManager!, _pieceManager!,
@@ -457,6 +475,10 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _serverSocket = null;
     await _fileManager?.close();
     _fileManager = null;
+    // Изолят-хэшер держит собственные read-хэндлы на файлы книги — гасим его
+    // после файлового менеджера, чтобы не оставить их висеть.
+    await _pieceVerifier?.dispose();
+    _pieceVerifier = null;
     await _dht?.stop();
     _dht = null;
 
@@ -558,6 +580,12 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     if (l == null) return 0.0;
     return d / l;
   }
+
+  @override
+  int get corruptedPiecesCount => _peersManager?.corruptedPiecesCount ?? 0;
+
+  @override
+  Set<String> get bannedPeerIds => _peersManager?.bannedPeerIds ?? const {};
 
   void _fireTaskPaused() {
     for (var element in _pauseHandlers) {

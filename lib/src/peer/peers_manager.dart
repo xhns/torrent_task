@@ -30,6 +30,13 @@ const MAX_IN_PEERS_PER_IP = 3;
 
 const MAX_WRITE_BUFFER_SIZE = 10 * 1024 * 1024;
 
+/// Сколько несошедшихся по SHA1 кусков прощаем пиру, прежде чем отключить его
+/// насовсем.
+///
+/// Не единица: кусок собирается из блоков нескольких пиров, и «виновником»
+/// может быть назначен честный сосед. Три подряд — уже система, а не совпадение.
+const MAX_BAD_PIECES_PER_PEER = 3;
+
 const MAX_UPLOADED_NOTIFY_SIZE = 1024 * 1024 * 10; // 10 mb
 
 ///
@@ -39,6 +46,31 @@ const MAX_UPLOADED_NOTIFY_SIZE = 1024 * 1024 * 10; // 10 mb
 class _RetryRecord {
   int attempts = 0;
   DateTime nextAttemptAt = DateTime.fromMillisecondsSinceEpoch(0);
+}
+
+/// Кто виноват в битом куске: [contributions] — сколько блоков этого куска
+/// прислал каждый пир.
+///
+/// Виновным считаем пира, приславшего БОЛЬШЕ ПОЛОВИНЫ блоков: точнее по хэшу
+/// целого куска не скажешь — какой именно блок приехал битым, неизвестно. Если
+/// кусок собирали вскладчину и явного большинства нет, не наказываем никого:
+/// ложный бан честного сида дороже одного лишнего перекачивания куска.
+///
+/// Ровно половина (2 пира по половине блоков) — это НЕ большинство: наказания
+/// не будет.
+String? blameForBadPiece(Map<String, int> contributions) {
+  if (contributions.isEmpty) return null;
+  var total = contributions.values.fold(0, (a, b) => a + b);
+  String? best;
+  var bestCount = 0;
+  contributions.forEach((id, count) {
+    if (count > bestCount) {
+      bestCount = count;
+      best = id;
+    }
+  });
+  if (bestCount * 2 <= total) return null;
+  return best;
 }
 
 class PeersManager with Holepunch, PEX {
@@ -75,6 +107,52 @@ class PeersManager with Holepunch, PEX {
   /// Сколько неудач подряд по одному адресу прежде чем перестать пробовать
   /// самим.
   int maxReconnectAttempts = 5;
+
+  /// Порог битых кусков на пира. Поле, а не константа: тесты и приложение
+  /// вправе его подстроить.
+  int maxBadPieces = MAX_BAD_PIECES_PER_PEER;
+
+  /// Кто прислал какие под-куски незавершённого куска:
+  /// `индекс куска -> (ключ источника -> сколько блоков от него)`.
+  ///
+  /// Ключ источника — [_blameKey], а НЕ `peer.id`: см. его док.
+  /// Заполняется в [_processReceivePiece] и живёт ровно до вердикта по куску.
+  final Map<int, Map<String, int>> _pieceContributions = {};
+
+  /// Сколько раз источник оказывался виновником несошедшегося куска
+  /// (по [_blameKey]).
+  final Map<String, int> _badPieceCounts = {};
+
+  /// Источники, отключённые за битые данные (по [_blameKey]). Проверяется на
+  /// рукопожатии: соединение забаненного клиента закрывается сразу.
+  final Set<String> _bannedPeerIds = {};
+
+  /// Адреса забаненных источников (`адрес:порт` в compact-виде) — чтобы не
+  /// набирать их снова по трекеру/DHT/LSD/PEX и не принимать входящие.
+  final Set<String> _bannedAddresses = {};
+
+  /// Диагностика/тесты: сколько кусков забраковала рантайм-проверка SHA1.
+  int corruptedPiecesCount = 0;
+
+  /// Диагностика/тесты: кого мы отключили за битые куски.
+  Set<String> get bannedPeerIds => Set.unmodifiable(_bannedPeerIds);
+
+  int badPieceCountOf(String peerId) => _badPieceCounts[peerId] ?? 0;
+
+  ///
+  /// Устойчивый ключ источника для учёта вклада в кусок и наказаний.
+  ///
+  /// Берём BitTorrent peer_id из рукопожатия, а не `адрес:порт`. Один и тот же
+  /// клиент держит с нами НЕСКОЛЬКО соединений (наше исходящее на его
+  /// слушающий порт + его входящее с эфемерного порта, принесённое LSD/PEX), и
+  /// по адресу это выглядит как разные пиры: вклад в кусок делится между ними
+  /// пополам, большинства нет, виновника нет — на живом прогоне это давало
+  /// вечную перекачку одного куска (31894 брака за две минуты) и бан честного
+  /// сида вместо битого.
+  ///
+  /// До рукопожатия блоки не ходят, так что при учёте вклада peer_id уже есть;
+  /// запасной вариант с адресом оставлен на всякий случай.
+  String _blameKey(Peer peer) => peer.remotePeerIdOrNull ?? peer.id!;
 
   InternetAddress? localExtenelIP;
 
@@ -130,6 +208,7 @@ class PeersManager with Holepunch, PEX {
     _fileManager.onSubPieceWriteFailed(_processSubPieceWriteFailed);
     _fileManager.onSubPieceReadComplete(readSubPieceComplete);
     _pieceManager.onPieceComplete(_processPieceWriteComplete);
+    _pieceManager.onPieceVerifyFailed(_processPieceVerifyFailed);
 
     // Start pex interval
     startPEX();
@@ -296,6 +375,13 @@ class PeersManager with Holepunch, PEX {
       socket?.close();
       return;
     }
+    // Отключённый за битые куски не возвращается ни сам, ни через
+    // трекер/DHT/LSD/PEX: иначе один сид с испорченной копией книги кормил бы
+    // нас мусором бесконечно.
+    if (_bannedAddresses.contains(address.toContactEncodingString())) {
+      socket?.close();
+      return;
+    }
     if (socket != null) {
       // 说明是主动连接的peer,目前只允许一个ip连一次
       //
@@ -400,7 +486,136 @@ class PeersManager with Holepunch, PEX {
     }
   }
 
+  /// Кусок собран, но SHA1 не сошёлся.
+  ///
+  /// К этому моменту `PieceManager` уже вернул все под-куски в очередь докачки.
+  /// Наша часть: наказать источник и снова сделать кусок скачиваемым — при
+  /// завершении куска `Piece.clearAvalidatePeer` стёр список доступных пиров, и
+  /// без восстановления `BasePieceSelector` этот кусок больше никому не выдаст
+  /// (он требует `containsAvalidatePeer`), а загрузка встанет навсегда.
+  void _processPieceVerifyFailed(int index) {
+    corruptedPiecesCount++;
+    var contributions = _pieceContributions.remove(index) ?? const {};
+    var culprit = blameForBadPiece(contributions);
+    log(
+      'Кусок $index не сошёлся с SHA1 (вклад пиров: $contributions), '
+      '${culprit == null ? 'виновник не определён' : 'виновник $culprit'}',
+      name: runtimeType.toString(),
+    );
+    if (culprit != null) _punishForBadPiece(culprit);
+
+    var piece = _pieceProvider[index];
+    if (piece == null) return;
+    var candidates = <Peer>[];
+    for (var peer in _activePeers) {
+      if (peer.isDisposed || peer.chokeMe) continue;
+      if (!peer.remoteHave(index)) continue;
+      if (_bannedPeerIds.contains(_blameKey(peer))) continue;
+      candidates.add(peer);
+    }
+    if (candidates.isEmpty) return;
+
+    if (culprit == null && contributions.length > 1 && candidates.length > 1) {
+      // Кусок собирали вскладчину и виноватого не видно. Перекачиваем его
+      // ЦЕЛИКОМ у ОДНОГО пира: иначе следующая попытка снова соберётся из
+      // блоков нескольких источников, вердикт снова окажется «большинства
+      // нет», и мы будем бесконечно качать один и тот же кусок, никого не
+      // наказывая (ровно так это и выглядело на прогоне: 31894 брака за две
+      // минуты и ни одного бана).
+      //
+      // Берём самого крупного вкладчика в провалившуюся попытку: если битые
+      // байты его, следующий провал будет адресным; если нет — кусок просто
+      // сойдётся.
+      var exclusive = _largestContributorAmong(candidates, contributions);
+      piece.restrictToPeer(exclusive.id!);
+      log(
+        'Кусок $index перекачиваем эксклюзивно у ${exclusive.id} — '
+        'вердикт по прошлой попытке был неадресным',
+        name: runtimeType.toString(),
+      );
+    } else {
+      for (var peer in candidates) {
+        piece.addAvalidatePeer(peer.id!);
+      }
+    }
+    _pieceManager.processDownloadingPiece(index);
+    for (var peer in _activePeers) {
+      if (peer.isSleeping) Timer.run(() => _requestPieces(peer, index));
+    }
+  }
+
+  ///
+  /// Раздать «осиротевшим» кускам доступных пиров заново.
+  ///
+  /// Кусок, у которого не осталось ни одного доступного пира, больше никем не
+  /// будет выбран: [BasePieceSelector] требует `containsAvalidatePeer`, а
+  /// список чистится при уходе пира (и при бане за битые куски). На живом
+  /// прогоне это выглядело так: битый сид забанен — и последний кусок, который
+  /// был только у него, навсегда остался недокачанным, хотя рядом был честный
+  /// сид с теми же данными.
+  void _rearmOrphanPieces() {
+    for (var peer in _activePeers) {
+      if (peer.isDisposed || peer.chokeMe) continue;
+      if (_bannedPeerIds.contains(_blameKey(peer))) continue;
+      for (var index in peer.remoteCompletePieces) {
+        var piece = _pieceProvider[index];
+        if (piece == null) continue;
+        if (piece.avalidatePeersCount > 0) continue;
+        if (!piece.haveAvalidateSubPiece()) continue;
+        piece.addAvalidatePeer(peer.id!);
+      }
+    }
+    // Будим спящих ВСЕГДА, а не только когда список доступных пиров изменился:
+    // ушедший пир унёс с собой запросы, и оставшаяся работа лежит в очереди
+    // куска, а просить её некому — `_requestPieces` вызывается только по
+    // приходу блока или по такому вот пинку. На живом прогоне это выглядело
+    // как вечный простой на последнем куске при двух живых сидах.
+    for (var peer in _activePeers) {
+      if (peer.isSleeping) Timer.run(() => _requestPieces(peer));
+    }
+  }
+
+  /// Самый крупный вкладчик провалившейся попытки среди [candidates]; если
+  /// никто из них в ней не участвовал — первый доступный.
+  Peer _largestContributorAmong(
+      List<Peer> candidates, Map<String, int> contributions) {
+    Peer? best;
+    var bestCount = -1;
+    for (var peer in candidates) {
+      var count = contributions[_blameKey(peer)] ?? 0;
+      if (count > bestCount) {
+        bestCount = count;
+        best = peer;
+      }
+    }
+    return best ?? candidates.first;
+  }
+
+  /// Отключить пира, если он перебрал лимит битых кусков.
+  void _punishForBadPiece(String peerId) {
+    var count = (_badPieceCounts[peerId] ?? 0) + 1;
+    _badPieceCounts[peerId] = count;
+    if (count < maxBadPieces) {
+      log('Пир $peerId прислал битый кусок ($count/$maxBadPieces)',
+          name: runtimeType.toString());
+      return;
+    }
+    _bannedPeerIds.add(peerId);
+    log('Источник $peerId отключён навсегда: $count битых кусков',
+        name: runtimeType.toString());
+    // Рвём ВСЕ соединения этого клиента (их обычно два — наше исходящее и его
+    // входящее) и запоминаем их адреса, чтобы не набрать их заново.
+    for (var peer in _activePeers.toList()) {
+      if (_blameKey(peer) != peerId) continue;
+      var contact = peer.address.toContactEncodingString();
+      if (contact != null) _bannedAddresses.add(contact);
+      Timer.run(() => peer.dispose(
+          BadException('Отключён за $count несошедшихся по SHA1 кусков')));
+    }
+  }
+
   void _processPieceWriteComplete(int index) async {
+    _pieceContributions.remove(index);
     if (_fileManager.localHave(index)) return;
     await _fileManager.updateBitfield(index);
     for (var peer in _activePeers) {
@@ -530,6 +745,9 @@ class PeersManager with Holepunch, PEX {
     for (var index in completedPieces) {
       _pieceProvider[index]?.removeAvalidatePeer(peer.id!);
     }
+    // Ушедший пир мог быть последним источником своих кусков — раздаём их
+    // оставшимся, иначе загрузка встанет на них навсегда.
+    _rearmOrphanPieces();
     _pausedRemoteRequest.remove(peer.id);
     var tempIndex = [];
     for (var i = 0; i < _pausedRequest.length; i++) {
@@ -541,6 +759,10 @@ class PeersManager with Holepunch, PEX {
     for (var index in tempIndex) {
       _pausedRequest.removeAt(index);
     }
+
+    // Забанен за битые куски — никаких переподключений, в том числе по ветке
+    // «сеятель, а мы ещё не докачали» ниже.
+    if (_bannedPeerIds.contains(_blameKey(peer))) return;
 
     if (reason is TCPConnectException) {
       // Адрес не отвечает. Своих попыток не планируем, но фиксируем неудачу:
@@ -590,11 +812,29 @@ class PeersManager with Holepunch, PEX {
       return;
     }
     var peer = source as Peer;
+    // Выброшенному пиру запрос отдавать нельзя: `sendRequest` всё равно
+    // положит его в буфер уже мёртвого соединения и вернёт `true`, под-кусок
+    // уйдёт из очереди и не вернётся никогда (`_pushSubpicesBack` для этого
+    // пира уже отработал в момент dispose). Нас сюда зовут через `Timer.run`,
+    // так что пир вполне может умереть между постановкой задачи и её
+    // выполнением — например, когда мы сами только что забанили его за битые
+    // куски. На живом прогоне это и был вечный простой на последнем куске:
+    // один под-кусок «завис» у выброшенного пира.
+    if (peer.isDisposed) return;
 
     Piece? piece;
     if (pieceIndex != -1 && _pieceProvider[pieceIndex] != null) {
       piece = _pieceProvider[pieceIndex];
-      if (!piece!.haveAvalidateSubPiece()) {
+      // Продолжать «свой» кусок можно, только если он не отдан в единоличную
+      // перекачку другому пиру. Эта ветка идёт мимо `selectPiece` и мимо
+      // проверки доступных пиров — без явного условия она сводила на нет любое
+      // ограничение источника: оба соединения с битым сидом продолжали
+      // подливать блоки в один и тот же кусок, и вердикт «кто виноват» вечно
+      // оставался неопределённым.
+      if (!piece!.allowsPeer(peer.id!)) {
+        piece = _pieceManager.selectPiece(peer.id!, peer.remoteCompletePieces,
+            _pieceProvider, peer.remoteSuggestPieces);
+      } else if (!piece.haveAvalidateSubPiece()) {
         piece = _pieceManager.selectPiece(peer.id!, peer.remoteCompletePieces,
             _pieceProvider, peer.remoteSuggestPieces);
       }
@@ -625,6 +865,17 @@ class PeersManager with Holepunch, PEX {
     var piece = _pieceManager[index];
     if (piece != null) {
       var i = index;
+      // Кто прислал этот блок — понадобится, если кусок не сойдётся с SHA1.
+      //
+      // Учёт огрублённый: считаем блоки на пира, а не помним источник каждого
+      // под-куска отдельно. Один и тот же под-piece, приехавший дважды (после
+      // таймаута/reject'а), учитывается обоим отправителям. Точной трассировки
+      // «этот байт от того пира» протокол всё равно не даёт: хэш ломается на
+      // куске целиком.
+      var contributions =
+          _pieceContributions.putIfAbsent(i, () => <String, int>{});
+      var key = _blameKey(peer);
+      contributions[key] = (contributions[key] ?? 0) + 1;
       Timer.run(() => _fileManager.writeFile(i, begin, block));
       piece.subPieceDownloadComplete(begin);
       if (piece.haveAvalidateSubPiece()) index = -1;
@@ -634,6 +885,15 @@ class PeersManager with Holepunch, PEX {
 
   void _processPeerHandshake(dynamic source, String remotePeerId, data) {
     var peer = source as Peer;
+    // Забаненный за битые куски клиент мог прийти с другого порта — узнаём его
+    // по peer_id и закрываемся сразу, до обмена данными.
+    if (_bannedPeerIds.contains(remotePeerId)) {
+      var contact = peer.address.toContactEncodingString();
+      if (contact != null) _bannedAddresses.add(contact);
+      Timer.run(() =>
+          peer.dispose(BadException('Отключён ранее за битые куски')));
+      return;
+    }
     peer.sendBitfield(_fileManager.localBitfield);
   }
 
@@ -819,6 +1079,7 @@ class PeersManager with Holepunch, PEX {
     _fileManager.offSubPieceWriteFailed(_processSubPieceWriteFailed);
     _fileManager.offSubPieceReadComplete(readSubPieceComplete);
     _pieceManager.offPieceComplete(_processPieceWriteComplete);
+    _pieceManager.offPieceVerifyFailed(_processPieceVerifyFailed);
 
     await _flushFiles(_flushIndicesBuffer);
     _flushIndicesBuffer.clear();
@@ -832,6 +1093,10 @@ class PeersManager with Holepunch, PEX {
     }
     _reconnectTimers.clear();
     _retryRecords.clear();
+    _pieceContributions.clear();
+    _badPieceCounts.clear();
+    _bannedPeerIds.clear();
+    _bannedAddresses.clear();
     Future<void> disposePeers(Set<Peer> peers) async {
       if (peers.isNotEmpty) {
         for (var i = 0; i < peers.length; i++) {
