@@ -257,6 +257,14 @@ abstract class Peer
 
   String get remotePeerId => _remotePeerId!;
 
+  /// BitTorrent peer_id удалённой стороны, либо `null`, если рукопожатия ещё
+  /// не было.
+  ///
+  /// В отличие от [id] (адрес:порт этого соединения) один и тот же клиент
+  /// приходит к нам под одним peer_id по всем своим соединениям — и нашему
+  /// исходящему на его слушающий порт, и его входящему с эфемерного.
+  String? get remotePeerIdOrNull => _remotePeerId;
+
   String get localPeerId => _localPeerId;
 
   /// 远程发送的Request请求

@@ -110,7 +110,10 @@ void main() {
       await writeFiles(tmp, model, files);
       final stateFile = await StateFile.getStateFile(tmp.path, model);
       final pieceManager = PieceManager.createPieceManager(
-          BasePieceSelector(), model, stateFile.bitfield);
+          // Тест про переподключения, куски здесь не докачиваются: проверка
+          // SHA1 отключена явно.
+          BasePieceSelector(), model, stateFile.bitfield,
+          verifier: null);
       final fileManager =
           await DownloadFileManager.createFileManager(model, tmp.path, stateFile);
       manager = PeersManager(

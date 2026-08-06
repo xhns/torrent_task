@@ -89,13 +89,43 @@ class Piece {
 
   bool subPieceWriteComplete(int begin) {
     var subindex = begin ~/ DEFAULT_REQUEST_LENGTH;
-    // _subPiecesQueue.remove(subindex); // 有这可能？
+    // Под-piece мог остаться в очереди докачки: его туда вернули по таймауту
+    // запроса/reject'у или целиком по [resetForRedownload], а «опоздавшая»
+    // запись прежнего экземпляра блока дошла уже после. Записанный блок в
+    // очереди держать нельзя — иначе счётчик `_downloadedSubPieces` дорастает
+    // до [isCompleted], пока очередь ещё не пуста, и хэш считается по куску,
+    // который сам себя считает недокачанным.
+    _subPiecesQueue!.remove(subindex);
     _writtingSubPieces.remove(subindex);
     var re = _downloadedSubPieces.add(subindex);
     if (isCompleted) {
       clearAvalidatePeer();
     }
     return re;
+  }
+
+  ///
+  /// Кусок собран целиком, но SHA1 не сошёлся — сбрасываем его в исходное
+  /// состояние, чтобы скачать заново.
+  ///
+  /// Возвращаем в очередь ВСЕ под-куски, а не только «подозрительные»: какой
+  /// именно блок приехал битым, по хэшу куска не видно, а частичная докачка
+  /// оставила бы битые байты на диске навсегда.
+  ///
+  /// Доступных пиров при завершении куска очистил [subPieceWriteComplete]
+  /// ([clearAvalidatePeer]), и здесь мы их намеренно не восстанавливаем: пиров
+  /// заново раздаёт `PeersManager`, уже без того, кого забанили за битый кусок.
+  void resetForRedownload() {
+    if (isDisposed) return;
+    // Прошлый вердикт отработан: кто качает кусок заново, решает вызывающая
+    // сторона (`PeersManager`), а не остатки прежнего ограничения.
+    liftRestriction();
+    _downloadedSubPieces.clear();
+    _writtingSubPieces.clear();
+    _subPiecesQueue!.clear();
+    for (var i = 0; i < _subPiecesCount; i++) {
+      _subPiecesQueue!.addLast(i);
+    }
   }
 
   ///
@@ -136,15 +166,53 @@ class Piece {
     return _avalidatePeers.contains(id);
   }
 
+  /// Пир, которому кусок отдан в единоличную перекачку, либо `null`.
+  String? _restrictedToPeerId;
+
+  String? get restrictedToPeerId => _restrictedToPeerId;
+
+  /// Разрешено ли пиру [id] качать этот кусок.
+  bool allowsPeer(String id) =>
+      _restrictedToPeerId == null || _restrictedToPeerId == id;
+
+  ///
+  /// Отдать кусок в единоличную перекачку пиру [peerId].
+  ///
+  /// Нужно, когда кусок не сошёлся с SHA1, а виновника определить не удалось:
+  /// пока кусок собирается из блоков нескольких источников, вердикт «виноват
+  /// такой-то» невозможен в принципе — и на живом прогоне это давало вечный
+  /// цикл (один и тот же кусок качался сотни раз в секунду, вклад пиров всегда
+  /// ровно 50/50, никто не наказан). Перекачка у одного источника делает
+  /// следующий вердикт адресным.
+  ///
+  /// Ограничение снимается [liftRestriction] либо уходом самого пира
+  /// ([removeAvalidatePeer]).
+  void restrictToPeer(String peerId) {
+    _restrictedToPeerId = peerId;
+    _avalidatePeers
+      ..clear()
+      ..add(peerId);
+  }
+
+  void liftRestriction() {
+    _restrictedToPeerId = null;
+  }
+
   bool removeSubpiece(int subIndex) {
     return subPieceQueue.remove(subIndex);
   }
 
   bool addAvalidatePeer(String id) {
+    // Кусок отдан в единоличную перекачку — чужих не пускаем, иначе следующая
+    // попытка снова соберётся вскладчину и виновника опять будет не видно.
+    if (!allowsPeer(id)) return false;
     return _avalidatePeers.add(id);
   }
 
   bool removeAvalidatePeer(String id) {
+    // Ушёл тот, кому кусок был отдан единолично — снимаем ограничение, иначе
+    // кусок больше некому качать.
+    if (_restrictedToPeerId == id) liftRestriction();
     return _avalidatePeers.remove(id);
   }
 
