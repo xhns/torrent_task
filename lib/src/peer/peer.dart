@@ -193,6 +193,13 @@ abstract class Peer
   /// Покрыто: test/extended_handshake_test.dart.
   final int localPort;
 
+  /// Соединение установил не мы, а удалённая сторона.
+  ///
+  /// Важно для переподключения: в [address] такого пира стоит эфемерный порт
+  /// источника, а не его слушающий порт, — стучаться туда обратно бессмысленно.
+  /// Покрыто: test/incoming_peers_test.dart.
+  final bool incoming;
+
   ///
   /// [_id] 是用于区分不同Peer的Id，和[_localPeerId]不同，[_localPeerId]是bt协议中的Peer_id。
   /// [address]是远程peer的地址和端口，子类在实现的时候可以利用该值进行远程连接。[_infoHashBuffer]
@@ -204,7 +211,8 @@ abstract class Peer
       this.localEnableFastPeer = true,
       this.localEnableExtended = true,
       this.reqq = DEFAULT_REQQ,
-      this.localPort = 0}) {
+      this.localPort = 0,
+      this.incoming = false}) {
     _remoteBitfield = Bitfield.createEmptyBitfield(_piecesNum);
   }
 
@@ -214,7 +222,9 @@ abstract class Peer
     return _TCPPeer(localPeerId, address, infoHashBuffer, piecesNum, socket,
         enableExtend: enableExtend,
         enableFast: enableFast,
-        localPort: localPort);
+        localPort: localPort,
+        // Готовый сокет на входе бывает только у принятого нами подключения.
+        incoming: socket != null);
   }
 
   factory Peer.newUTPPeer(String localPeerId, CompactAddress address,
@@ -223,7 +233,8 @@ abstract class Peer
     return _UTPPeer(localPeerId, address, infoHashBuffer, piecesNum, socket as UTPSocket?,
         enableExtend: enableExtend,
         enableFast: enableFast,
-        localPort: localPort);
+        localPort: localPort,
+        incoming: socket != null);
   }
 
   /// 远程的Bitfield
@@ -1251,13 +1262,21 @@ abstract class Peer
     }
   }
 
+  /// Тождество пира — адрес И порт, как и в [id].
+  ///
+  /// Сравнение по одному IP склеивало разных пиров за одним NAT (и два клиента
+  /// на одной машине): второй не попадал в множество активных — его не
+  /// считали, ему не слали `have`. При этом [id], по которому пира знает
+  /// piece-учёт, порт всегда включал, так что две части класса расходились.
+  /// Покрыто: test/incoming_peers_test.dart.
   @override
-  int get hashCode => address.address.address.hashCode;
+  int get hashCode => Object.hash(address.address.address, address.port);
 
   @override
   bool operator ==(other) {
     if (other is Peer) {
-      return other.address.address.address == address.address.address;
+      return other.address.address.address == address.address.address &&
+          other.address.port == address.port;
     }
     return false;
   }
@@ -1283,7 +1302,10 @@ class _TCPPeer extends Peer {
   Socket? _socket;
   _TCPPeer(super.localPeerId, super.address, super.infoHashBuffer,
       super.piecesNum, this._socket,
-      {bool enableExtend = true, bool enableFast = true, super.localPort})
+      {bool enableExtend = true,
+      bool enableFast = true,
+      super.localPort,
+      super.incoming})
       : super(type: PeerType.TCP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);
@@ -1335,7 +1357,10 @@ class _UTPPeer extends Peer {
   UTPSocket? _socket;
   _UTPPeer(super.localPeerId, super.address, super.infoHashBuffer,
       super.piecesNum, this._socket,
-      {bool enableExtend = true, bool enableFast = true, super.localPort})
+      {bool enableExtend = true,
+      bool enableFast = true,
+      super.localPort,
+      super.incoming})
       : super(type: PeerType.UTP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);

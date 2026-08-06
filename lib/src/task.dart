@@ -19,7 +19,6 @@ import 'peer/peers_manager.dart';
 import 'utils.dart';
 
 const MAX_PEERS = 50;
-const MAX_IN_PEERS = 10;
 
 abstract class TorrentTask {
   factory TorrentTask.newTask(Torrent metaInfo, String savePath) {
@@ -164,8 +163,6 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   ServerSocket? _serverSocket;
 
-  final Set<InternetAddress> _cominIp = {};
-
   bool _paused = false;
 
   _TorrentTask(this._metaInfo, this._savePath) {
@@ -301,14 +298,23 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
       socket.close();
       return;
     }
-    if (_cominIp.length >= MAX_IN_PEERS || !_cominIp.add(socket.address)) {
-      socket.close();
-      return;
-    }
     log('incoming connect: ${socket.remoteAddress.address}:${socket.remotePort}',
         name: runtimeType.toString());
+    // `socket.address`/`socket.port` — это НАША сторона (bind-адрес 0.0.0.0 и
+    // наш же слушающий порт), а не подключившийся пир. Из-за подмены каждый
+    // входящий регистрировался под одним и тем же фиктивным адресом, а старый
+    // счётчик `_cominIp` на `socket.address` навсегда занимался первым же
+    // подключением и не освобождался — второе входящее соединение за всю жизнь
+    // задачи закрывалось сразу. Для раздачи это означало ровно одного
+    // качающего, и то до первого обрыва.
+    //
+    // Лимит входящих переехал в PeersManager: там адрес освобождается, когда
+    // пир отваливается.
+    // Покрыто: test/incoming_peers_test.dart.
     _peersManager?.addNewPeerAddress(
-        CompactAddress(socket.address, socket.port), PeerType.TCP, socket);
+        CompactAddress(socket.remoteAddress, socket.remotePort),
+        PeerType.TCP,
+        socket);
   }
 
   @override
@@ -440,7 +446,6 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _lsd?.close();
     _lsd = null;
     _peerIds.clear();
-    _cominIp.clear();
     return;
   }
 

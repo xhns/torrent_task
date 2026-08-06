@@ -17,6 +17,17 @@ import '../peer/holepunch.dart';
 
 const MAX_ACTIVE_PEERS = 50;
 
+/// Сколько входящих соединений держим одновременно суммарно.
+const MAX_IN_PEERS = 10;
+
+/// Сколько входящих соединений допускаем с одного IP.
+///
+/// Было ровно одно («目前只允许一个ip连一次»), и это резало самый частый случай
+/// раздачи: два устройства за одним NAT (а у мобильных операторов — за одним
+/// CGNAT) приходят к нам с одного адреса, и второму мы отказывали. Лимит нужен
+/// как защита от исчерпания слотов одним источником, а не как запрет NAT.
+const MAX_IN_PEERS_PER_IP = 3;
+
 const MAX_WRITE_BUFFER_SIZE = 10 * 1024 * 1024;
 
 const MAX_UPLOADED_NOTIFY_SIZE = 1024 * 1024 * 10; // 10 mb
@@ -24,6 +35,12 @@ const MAX_UPLOADED_NOTIFY_SIZE = 1024 * 1024 * 10; // 10 mb
 ///
 /// TODO:
 /// - 没有处理对外的Suggest Piece/Fast Allow
+/// Учёт неудачных исходящих подключений к одному адресу.
+class _RetryRecord {
+  int attempts = 0;
+  DateTime nextAttemptAt = DateTime.fromMillisecondsSinceEpoch(0);
+}
+
 class PeersManager with Holepunch, PEX {
   final List<InternetAddress> IGNORE_IPS = [
     InternetAddress.tryParse('0.0.0.0')!,
@@ -38,7 +55,26 @@ class PeersManager with Holepunch, PEX {
 
   final Set<CompactAddress> _peersAddress = {};
 
-  final Set<InternetAddress> _incomingAddress = {};
+  /// Сколько входящих соединений сейчас держит каждый IP. Счётчик уменьшается
+  /// в [_processPeerDispose], поэтому слот освобождается при обрыве.
+  final Map<InternetAddress, int> _incomingAddress = {};
+
+  /// Учёт неудачных исходящих подключений: адрес -> сколько попыток подряд
+  /// провалилось и когда можно пробовать снова.
+  final Map<CompactAddress, _RetryRecord> _retryRecords = {};
+
+  final Set<Timer> _reconnectTimers = {};
+
+  /// Стартовая пауза перед повторным подключением к отвалившемуся адресу;
+  /// дальше удваивается до [reconnectMaxDelay]. Поле, а не константа: тесты
+  /// сжимают паузу, приложение может её подстроить.
+  Duration reconnectBaseDelay = const Duration(seconds: 15);
+
+  Duration reconnectMaxDelay = const Duration(minutes: 5);
+
+  /// Сколько неудач подряд по одному адресу прежде чем перестать пробовать
+  /// самим.
+  int maxReconnectAttempts = 5;
 
   InternetAddress? localExtenelIP;
 
@@ -256,12 +292,29 @@ class PeersManager with Holepunch, PEX {
   /// this type peer was managed by [TorrentTask] , user don't need to know that.
   void addNewPeerAddress(CompactAddress address,
       [PeerType type = PeerType.TCP, Socket? socket]) {
-    if (address.address == localExtenelIP) return;
+    if (address.address == localExtenelIP) {
+      socket?.close();
+      return;
+    }
     if (socket != null) {
       // 说明是主动连接的peer,目前只允许一个ip连一次
-      if (!_incomingAddress.add(address.address)) {
+      //
+      // Слот освобождается в [_processPeerDispose], поэтому после разрыва тот
+      // же адрес может подключиться снова. Раньше этот учёт (по факту —
+      // сломанный, см. `_hookInPeer`) жил в TorrentTask и не освобождался
+      // никогда.
+      var total = _incomingAddress.values.fold(0, (a, b) => a + b);
+      var fromThisIp = _incomingAddress[address.address] ?? 0;
+      if (total >= MAX_IN_PEERS || fromThisIp >= MAX_IN_PEERS_PER_IP) {
+        socket.close();
         return;
       }
+      _incomingAddress[address.address] = fromThisIp + 1;
+    } else if (!_mayDialOutTo(address)) {
+      // Исходящее подключение к адресу, который недавно отвалился, — придержим
+      // до истечения паузы. На входящие это правило не распространяется: это не
+      // наша попытка, и отказ от неё убил бы раздачу.
+      return;
     }
     if (_peersAddress.add(address)) {
       Peer? peer;
@@ -276,7 +329,46 @@ class PeersManager with Holepunch, PEX {
             localPort: localPort);
       }
       if (peer != null) _hookPeer(peer);
+    } else {
+      // Адрес уже обслуживается — дублирующий сокет закрываем, а не роняем.
+      socket?.close();
     }
+  }
+
+  /// Можно ли прямо сейчас инициировать исходящее подключение к [address].
+  bool _mayDialOutTo(CompactAddress address) {
+    var record = _retryRecords[address];
+    if (record == null) return true;
+    if (DateTime.now().isBefore(record.nextAttemptAt)) return false;
+    // Пауза выдержана — счётчик попыток обнуляем, адрес снова «свежий».
+    _retryRecords.remove(address);
+    return true;
+  }
+
+  /// Запланировать повторное подключение к отвалившемуся пиру.
+  ///
+  /// Раньше `_processPeerDispose` звал `addNewPeerAddress` немедленно и без
+  /// ограничений: пир, рвущий соединение сразу после handshake, крутил нас в
+  /// плотном цикле переподключений. Пауза растёт экспоненциально от
+  /// [reconnectBaseDelay] до [reconnectMaxDelay], после
+  /// [maxReconnectAttempts] неудач подряд свои попытки прекращаем — адрес
+  /// вернётся, только если его снова принесут трекер/DHT/LSD/PEX, и то не
+  /// раньше конца паузы.
+  void _scheduleReconnect(CompactAddress address, PeerType type) {
+    if (isDisposed) return;
+    var record = _retryRecords.putIfAbsent(address, () => _RetryRecord());
+    record.attempts++;
+    var delay = reconnectBaseDelay * (1 << (record.attempts - 1));
+    if (delay > reconnectMaxDelay) delay = reconnectMaxDelay;
+    record.nextAttemptAt = DateTime.now().add(delay);
+    if (record.attempts > maxReconnectAttempts) return;
+    late Timer timer;
+    timer = Timer(delay, () {
+      _reconnectTimers.remove(timer);
+      if (isDisposed) return;
+      addNewPeerAddress(address, type);
+    });
+    _reconnectTimers.add(timer);
   }
 
   void _processSubPieceWriteComplte(int pieceIndex, int begin, int length) {
@@ -421,7 +513,14 @@ class PeersManager with Holepunch, PEX {
     }
 
     _peersAddress.remove(peer.address);
-    _incomingAddress.remove(peer.address.address);
+    if (peer.incoming) {
+      var left = (_incomingAddress[peer.address.address] ?? 1) - 1;
+      if (left <= 0) {
+        _incomingAddress.remove(peer.address.address);
+      } else {
+        _incomingAddress[peer.address.address] = left;
+      }
+    }
     _activePeers.remove(peer);
 
     var bufferRequests = peer.requestBuffer;
@@ -444,26 +543,43 @@ class PeersManager with Holepunch, PEX {
     }
 
     if (reason is TCPConnectException) {
-      // print('TCPConnectException');
-      // addNewPeerAddress(peer.address, PeerType.UTP);
+      // Адрес не отвечает. Своих попыток не планируем, но фиксируем неудачу:
+      // если тот же адрес принесёт трекер/DHT, мы не побежим к нему сразу.
+      _noteFailedDial(peer.address);
       return;
     }
 
+    // К входящему подключению обратно не стучимся: в его адресе стоит
+    // эфемерный порт источника, а не слушающий порт пира — соединение туда
+    // заведомо некуда. Такой пир вернётся сам.
+    if (peer.incoming) return;
+
     if (reconnect) {
       if (_activePeers.length < MAX_ACTIVE_PEERS && !isDisposed) {
-        addNewPeerAddress(peer.address, peer.type);
+        _scheduleReconnect(peer.address, peer.type);
       }
     } else {
       if (peer.isSeeder && !_fileManager.isAllComplete && !isDisposed) {
-        addNewPeerAddress(peer.address, peer.type);
+        _scheduleReconnect(peer.address, peer.type);
       }
     }
+  }
+
+  /// Отметить неудачную попытку исходящего подключения, ничего не планируя.
+  void _noteFailedDial(CompactAddress address) {
+    var record = _retryRecords.putIfAbsent(address, () => _RetryRecord());
+    record.attempts++;
+    var delay = reconnectBaseDelay * (1 << (record.attempts - 1));
+    if (delay > reconnectMaxDelay) delay = reconnectMaxDelay;
+    record.nextAttemptAt = DateTime.now().add(delay);
   }
 
   void _peerConnected(dynamic source) {
     _startedTime ??= DateTime.now().millisecondsSinceEpoch;
     _endTime = null;
     var peer = source as Peer;
+    // Связь установлена — история неудач по этому адресу больше не актуальна.
+    _retryRecords.remove(peer.address);
     _activePeers.add(peer);
     peer.sendHandShake();
   }
@@ -711,6 +827,11 @@ class PeersManager with Holepunch, PEX {
     _remoteRequest.clear();
     _pausedRequest.clear();
     _pausedRemoteRequest.clear();
+    for (var t in _reconnectTimers) {
+      t.cancel();
+    }
+    _reconnectTimers.clear();
+    _retryRecords.clear();
     Future<void> disposePeers(Set<Peer> peers) async {
       if (peers.isNotEmpty) {
         for (var i = 0; i < peers.length; i++) {
