@@ -128,6 +128,10 @@ abstract class Peer
   /// has this peer send handshake message already?
   bool _handShaked = false;
 
+  /// Получено ли рукопожатие ОТ собеседника. До него в потоке не может быть
+  /// ничего, кроме BitTorrent handshake.
+  bool _remoteHandShaked = false;
+
   /// has this peer send local bitfield to remote?
   bool _bitfieldSended = false;
 
@@ -153,6 +157,14 @@ abstract class Peer
   // /// Max request count in one piple ,5
   static const MAX_REQUEST_COUNT = 5;
 
+  /// Глубина пайплайна входящих запросов, которую мы объявляем в extended
+  /// handshake (`reqq`, BEP 10) и держим в [_remoteRequestBuffer].
+  ///
+  /// 100 не хватало: aria2c выдаёт пачку ~192 запросов, libtorrent-клиенты
+  /// держат в полёте столько же и больше. 500 — то же значение, что у
+  /// libtorrent по умолчанию.
+  static const DEFAULT_REQQ = 500;
+
   bool remoteEnableFastPeer = false;
 
   bool localEnableFastPeer = true;
@@ -176,6 +188,22 @@ abstract class Peer
 
   int? remoteReqq;
 
+  /// Наш собственный слушающий TCP-порт: уходит в extended handshake полем `p`
+  /// (BEP 10). 0 = неизвестен, тогда поле не отправляется.
+  ///
+  /// Без него пир, к которому подключились МЫ, видит наш исходящий эфемерный
+  /// порт и не знает, куда стучаться в ответ: он не переподключится к нам и не
+  /// расскажет о нас через PEX. aria2 в замере показывал tcpPort=0.
+  /// Покрыто: test/extended_handshake_test.dart.
+  final int localPort;
+
+  /// Соединение установил не мы, а удалённая сторона.
+  ///
+  /// Важно для переподключения: в [address] такого пира стоит эфемерный порт
+  /// источника, а не его слушающий порт, — стучаться туда обратно бессмысленно.
+  /// Покрыто: test/incoming_peers_test.dart.
+  final bool incoming;
+
   ///
   /// [_id] 是用于区分不同Peer的Id，和[_localPeerId]不同，[_localPeerId]是bt协议中的Peer_id。
   /// [address]是远程peer的地址和端口，子类在实现的时候可以利用该值进行远程连接。[_infoHashBuffer]
@@ -186,22 +214,31 @@ abstract class Peer
       {this.type = PeerType.TCP,
       this.localEnableFastPeer = true,
       this.localEnableExtended = true,
-      this.reqq = 100}) {
+      this.reqq = DEFAULT_REQQ,
+      this.localPort = 0,
+      this.incoming = false}) {
     _remoteBitfield = Bitfield.createEmptyBitfield(_piecesNum);
   }
 
   factory Peer.newTCPPeer(String localPeerId, CompactAddress address,
       List<int> infoHashBuffer, int piecesNum, Socket? socket,
-      {bool enableExtend = true, bool enableFast = true}) {
+      {bool enableExtend = true, bool enableFast = true, int localPort = 0}) {
     return _TCPPeer(localPeerId, address, infoHashBuffer, piecesNum, socket,
-        enableExtend: enableExtend, enableFast: enableFast);
+        enableExtend: enableExtend,
+        enableFast: enableFast,
+        localPort: localPort,
+        // Готовый сокет на входе бывает только у принятого нами подключения.
+        incoming: socket != null);
   }
 
   factory Peer.newUTPPeer(String localPeerId, CompactAddress address,
       List<int> infoHashBuffer, int piecesNum, Socket? socket,
-      {bool enableExtend = true, bool enableFast = true}) {
+      {bool enableExtend = true, bool enableFast = true, int localPort = 0}) {
     return _UTPPeer(localPeerId, address, infoHashBuffer, piecesNum, socket as UTPSocket?,
-        enableExtend: enableExtend, enableFast: enableFast);
+        enableExtend: enableExtend,
+        enableFast: enableFast,
+        localPort: localPort,
+        incoming: socket != null);
   }
 
   /// 远程的Bitfield
@@ -285,6 +322,7 @@ abstract class Peer
     _disposeReason = null;
     _disposed = false;
     _handShaked = false;
+    _remoteHandShaked = false;
     // 清空通道数据缓存：
     _resetRecv();
     // 清空请求缓存
@@ -391,6 +429,43 @@ abstract class Peer
     if (data != null && data.isNotEmpty) _startToCountdown();
     if (data != null) _appendToRecv(data as List<int>); // буферизуем приём
     if (_recvAvailable == 0) return;
+    // Пока рукопожатия от собеседника не было, первым в потоке обязан идти
+    // BitTorrent handshake. Всё остальное — не наш протокол: чаще всего это
+    // MSE/PE (шифрованное рукопожатие), с которого aria2/qBittorrent начинают
+    // ИСХОДЯЩЕЕ подключение.
+    //
+    // Раньше такой поток молча проваливался в разбор сообщений, длина первого
+    // «сообщения» бралась из случайных байт DH-ключа, и соединение висело до
+    // 150-секундного таймаута тишины. Для инициатора это выглядит как
+    // «подключился и молчит»: aria2 переходит на открытое рукопожатие только
+    // по ОШИБКЕ сокета, а её не было — обмен вставал намертво. Замерено: за
+    // 100 секунд по входящему соединению не ушло ни байта, при том что то же
+    // самое aria2 качало на 10 МБ/с по соединению, которое инициировали мы.
+    //
+    // Закрываемся сразу: инициатор получает ошибку и тут же повторяет попытку
+    // в открытом виде — этот путь у него штатный.
+    // Покрыто: test/handshake_validation_test.dart.
+    if (!_remoteHandShaked) {
+      var check = _recvAvailable < HAND_SHAKE_HEAD.length
+          ? _recvAvailable
+          : HAND_SHAKE_HEAD.length;
+      for (var i = 0; i < check; i++) {
+        if (_recvByte(i) != HAND_SHAKE_HEAD[i]) {
+          dispose(BadException(
+              '$address : поток начинается не с BitTorrent handshake '
+              '(вероятно MSE/PE), закрываем — пусть повторит открытым'));
+          return;
+        }
+      }
+      // Сигнатура пока совпадает, но рукопожатие ещё не целиком — ждём добора.
+      //
+      // Явный выход, а не необходимость: без него поток ушёл бы в разбор
+      // сообщений ниже, где длина первого «сообщения» вышла бы равной
+      // 0x13426974 и цикл всё равно ничего бы не потребил. То есть снятие этой
+      // строки поведения не меняет — мутация по ней эквивалентная, тестом она
+      // и не может быть поймана.
+      if (_recvAvailable < 68) return;
+    }
     // 查看是不是handshake头
     if (_recvByte(0) == 19 && _recvAvailable >= 68) {
       if (_isHandShakeHeadAt()) {
@@ -398,6 +473,7 @@ abstract class Peer
           var handshakeBuffer = Uint8List(68);
           handshakeBuffer.setRange(0, 68, _recvBuf, _recvStart);
           _consumeRecv(68);
+          _remoteHandShaked = true;
           Timer.run(() => _processHandShake(handshakeBuffer));
           // Остаток разбираем тем же проходом ниже (без повторного Timer.run-входа).
         } else {
@@ -705,13 +781,6 @@ abstract class Peer
   /// the peer receiving the requests MAY close the connection rather than reject the request.
   /// However, consider that it can take several seconds for buffers to drain and messages to propagate once a peer is choked.
   void _processRemoteRequest(Uint8List message) {
-    if (_remoteRequestBuffer.length > reqq) {
-      dev.log('Request Error:',
-          error: 'Too many requests from $address',
-          name: runtimeType.toString());
-      dispose(BadException('Too many requests from $address'));
-      return;
-    }
     var view = ByteData.view(message.buffer);
     var index = view.getUint32(0);
     var begin = view.getUint32(4);
@@ -733,6 +802,28 @@ abstract class Peer
         // sendRejectRequest(index, begin, length);
         return;
       }
+    }
+
+    // Пайплайн глубже заявленного нами reqq — это НЕ повод рвать соединение.
+    //
+    // BEP 10 определяет `reqq` как «сколько запросов клиент держит, ничего не
+    // отбрасывая»; превышение даёт право отбросить лишнее, но не разорвать
+    // связь. Раньше здесь стоял `dispose()`, и при дефолте reqq=100 любой
+    // взрослый клиент (aria2 шлёт пачкой ~192, libtorrent/qBittorrent
+    // пайплайнят так же агрессивно) убивал передачу на середине: замерено 2375
+    // запросов, отдано 2183 piece, 192 неотвеченных — обрыв на 86%.
+    //
+    // Разрывать по числу запросов больше нечем: очередь ограничена [reqq]
+    // конструктивно (ниже мы просто не ставим лишнее), так что «буфер растёт
+    // неограниченно» стало недостижимо, а не «переехало на порог повыше».
+    // Инвариант ограниченности проверяется тестом.
+    // Покрыто: test/remote_request_pipelining_test.dart.
+    if (_remoteRequestBuffer.length >= reqq) {
+      // Fast extension: честно говорим «этот блок не приедет», чтобы адресат не
+      // ждал его до своего таймаута. Без fast extension метод — no-op, и запрос
+      // просто молча отбрасывается (что BEP 10 и разрешает).
+      sendRejectRequest(index, begin, length);
+      return;
     }
 
     _remoteRequestBuffer.add([index, begin, length]);
@@ -880,6 +971,9 @@ abstract class Peer
     d['v'] = 'Dart BT v$version';
     d['m'] = localExtened;
     d['reqq'] = reqq;
+    // BEP 10: `p` — наш слушающий TCP-порт. Отдаём только если он реально
+    // известен: 0 в этом поле хуже отсутствия, его нельзя отличить от «порт 0».
+    if (localPort > 0) d['p'] = localPort;
     var m = encode(d);
     message.addAll(m as Iterable<int>);
     return message;
@@ -1190,6 +1284,7 @@ abstract class Peer
     _disposeReason = reason;
     _disposed = true;
     _handShaked = false;
+    _remoteHandShaked = false;
     _bitfieldSended = false;
     fireDisposeEvent(reason);
     clearEventHandles();
@@ -1211,13 +1306,21 @@ abstract class Peer
     }
   }
 
+  /// Тождество пира — адрес И порт, как и в [id].
+  ///
+  /// Сравнение по одному IP склеивало разных пиров за одним NAT (и два клиента
+  /// на одной машине): второй не попадал в множество активных — его не
+  /// считали, ему не слали `have`. При этом [id], по которому пира знает
+  /// piece-учёт, порт всегда включал, так что две части класса расходились.
+  /// Покрыто: test/incoming_peers_test.dart.
   @override
-  int get hashCode => address.address.address.hashCode;
+  int get hashCode => Object.hash(address.address.address, address.port);
 
   @override
   bool operator ==(other) {
     if (other is Peer) {
-      return other.address.address.address == address.address.address;
+      return other.address.address.address == address.address.address &&
+          other.address.port == address.port;
     }
     return false;
   }
@@ -1243,7 +1346,10 @@ class _TCPPeer extends Peer {
   Socket? _socket;
   _TCPPeer(super.localPeerId, super.address, super.infoHashBuffer,
       super.piecesNum, this._socket,
-      {bool enableExtend = true, bool enableFast = true})
+      {bool enableExtend = true,
+      bool enableFast = true,
+      super.localPort,
+      super.incoming})
       : super(type: PeerType.TCP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);
@@ -1295,7 +1401,10 @@ class _UTPPeer extends Peer {
   UTPSocket? _socket;
   _UTPPeer(super.localPeerId, super.address, super.infoHashBuffer,
       super.piecesNum, this._socket,
-      {bool enableExtend = true, bool enableFast = true})
+      {bool enableExtend = true,
+      bool enableFast = true,
+      super.localPort,
+      super.incoming})
       : super(type: PeerType.UTP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);

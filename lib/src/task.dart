@@ -19,7 +19,6 @@ import 'peer/peers_manager.dart';
 import 'utils.dart';
 
 const MAX_PEERS = 50;
-const MAX_IN_PEERS = 10;
 
 abstract class TorrentTask {
   factory TorrentTask.newTask(Torrent metaInfo, String savePath) {
@@ -164,8 +163,6 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   ServerSocket? _serverSocket;
 
-  final Set<InternetAddress> _cominIp = {};
-
   bool _paused = false;
 
   _TorrentTask(this._metaInfo, this._savePath) {
@@ -222,8 +219,8 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
         BasePieceSelector(), model, _stateFile!.bitfield);
     _fileManager ??= await DownloadFileManager.createFileManager(
         model, savePath, _stateFile!);
-    _peersManager ??= PeersManager(
-        _peerId!, _pieceManager!, _pieceManager!, _fileManager!, model);
+    _peersManager ??= PeersManager(_peerId!, _pieceManager!, _pieceManager!,
+        _fileManager!, model, MAX_WRITE_BUFFER_SIZE, _serverSocket?.port ?? 0);
     return _peersManager!;
   }
 
@@ -236,7 +233,40 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   void _whenTaskDownloadComplete() async {
     await _peersManager?.disposeAllSeeder('Download complete,disconnect seeder');
     await _tracker?.complete();
+    // `Tracker.complete()` делает `stopIntervalAnnounce()` + `close()`: после
+    // единственного `completed`-анонса периодический цикл мёртв, и трекер
+    // выкидывает нас из сварма по истечении своего peer-таймаута. Для только
+    // что докачавшего клиента это ровно тот же итог, что и блокер выше —
+    // раздавать некому. Поднимаем цикл обратно.
+    // Покрыто: test/seeding_announce_test.dart.
+    _restartTrackerAnnounces();
     _fireTaskComplete();
+  }
+
+  /// Возобновить периодический анонс по всем announce-url торрента.
+  ///
+  /// Каждый url — отдельно и под защитой: `Tracker.restart()` БРОСАЕТ на уже
+  /// выброшенном трекере, а выброшен он к этому моменту запросто —
+  /// `Tracker.complete()` сам делает `dispose(e)`, если не достучался до
+  /// трекера. Вызывают нас из `void ... async`-обработчика, поэтому исключение
+  /// отсюда становится unhandled и роняет процесс целиком: на живом стенде
+  /// качающий с недоступным трекером умирал ровно в момент завершения загрузки,
+  /// не дописав файлы на диск.
+  ///
+  /// Недоступный трекер — не причина падать: раздача живёт и на LSD/DHT/PEX и
+  /// на уже известных пирах.
+  /// Покрыто: test/download_then_seed_test.dart.
+  void _restartTrackerAnnounces() {
+    final tracker = _tracker;
+    if (tracker == null) return;
+    for (var url in _metaInfo!.announces) {
+      try {
+        tracker.restartTracker(url);
+      } catch (e) {
+        log('не удалось возобновить анонсы на $url: $e',
+            name: runtimeType.toString());
+      }
+    }
   }
 
   void _whenFileDownloadComplete(String filePath) {
@@ -252,8 +282,22 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     }
   }
 
+  /// Пир, найденный через Local Service Discovery (BEP 14).
+  ///
+  /// Раньше здесь стоял только отладочный `print` — найденный в локальной сети
+  /// пир выбрасывался, и раздача между двумя устройствами в одном Wi-Fi не
+  /// работала вовсе, даже когда трекер недоступен.
+  ///
+  /// Мультикаст-сокет LSD принимает анонсы ВСЕХ торрентов в сети, поэтому
+  /// infohash обязателен к сверке — иначе в сварм чужой книги полетели бы наши
+  /// подключения. Сравнение регистронезависимое: BEP 14 не фиксирует регистр
+  /// hex, и клиенты шлют по-разному.
+  /// Покрыто: test/lsd_peer_test.dart.
   void _processLSDPeerEvent(CompactAddress address, String infoHash) {
-    print('居然有LSD！！');
+    final mine = _metaInfo?.infoHash;
+    if (mine == null) return;
+    if (infoHash.toLowerCase() != mine.toLowerCase()) return;
+    _processNewPeerFound(address);
   }
 
   void _processNewPeerFound(CompactAddress url) {
@@ -271,14 +315,23 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
       socket.close();
       return;
     }
-    if (_cominIp.length >= MAX_IN_PEERS || !_cominIp.add(socket.address)) {
-      socket.close();
-      return;
-    }
     log('incoming connect: ${socket.remoteAddress.address}:${socket.remotePort}',
         name: runtimeType.toString());
+    // `socket.address`/`socket.port` — это НАША сторона (bind-адрес 0.0.0.0 и
+    // наш же слушающий порт), а не подключившийся пир. Из-за подмены каждый
+    // входящий регистрировался под одним и тем же фиктивным адресом, а старый
+    // счётчик `_cominIp` на `socket.address` навсегда занимался первым же
+    // подключением и не освобождался — второе входящее соединение за всю жизнь
+    // задачи закрывалось сразу. Для раздачи это означало ровно одного
+    // качающего, и то до первого обрыва.
+    //
+    // Лимит входящих переехал в PeersManager: там адрес освобождается, когда
+    // пир отваливается.
+    // Покрыто: test/incoming_peers_test.dart.
     _peersManager?.addNewPeerAddress(
-        CompactAddress(socket.address, socket.port), PeerType.TCP, socket);
+        CompactAddress(socket.remoteAddress, socket.remotePort),
+        PeerType.TCP,
+        socket);
   }
 
   @override
@@ -355,13 +408,20 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _dht?.onNewPeer(_processDHTPeer);
     // ignore: unawaited_futures
     _dht?.bootstrap();
-    if (_fileManager!.isAllComplete) {
-      // ignore: unawaited_futures
-      _tracker?.complete();
-    } else {
-      _tracker?.runTrackers(_metaInfo!.announces, _metaInfo!.infoHashBuffer!,
-          event: EVENT_STARTED);
-    }
+    // Анонс `started` шлём ВСЕГДА, в том числе для уже полного торрента.
+    //
+    // Раньше полный торрент уходил в ветку `_tracker.complete()`, а
+    // `TorrentAnnounceTracker.complete()` перебирает карту `_trackers`, которую
+    // заполняет только `runTracker()`/`runTrackers()`. На старте карта пуста →
+    // ни одного обращения к трекеру → чистого сида никто не находил (это и есть
+    // «0 роздано» после перезапуска приложения с уже скачанными книгами).
+    //
+    // Ветка была неверна и по протоколу: BEP 3 требует НЕ слать `completed`,
+    // если торрент был полон уже на старте клиента. Сид анонсируется как все,
+    // просто с `left=0` (см. [getOptions]).
+    // Покрыто: test/seeding_announce_test.dart.
+    _tracker?.runTrackers(_metaInfo!.announces, _metaInfo!.infoHashBuffer!,
+        event: EVENT_STARTED);
     return map;
   }
 
@@ -403,7 +463,6 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _lsd?.close();
     _lsd = null;
     _peerIds.clear();
-    _cominIp.clear();
     return;
   }
 
