@@ -236,7 +236,23 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   void _whenTaskDownloadComplete() async {
     await _peersManager?.disposeAllSeeder('Download complete,disconnect seeder');
     await _tracker?.complete();
+    // `Tracker.complete()` делает `stopIntervalAnnounce()` + `close()`: после
+    // единственного `completed`-анонса периодический цикл мёртв, и трекер
+    // выкидывает нас из сварма по истечении своего peer-таймаута. Для только
+    // что докачавшего клиента это ровно тот же итог, что и блокер выше —
+    // раздавать некому. Поднимаем цикл обратно.
+    // Покрыто: test/seeding_announce_test.dart.
+    _restartTrackerAnnounces();
     _fireTaskComplete();
+  }
+
+  /// Возобновить периодический анонс по всем announce-url торрента.
+  void _restartTrackerAnnounces() {
+    final tracker = _tracker;
+    if (tracker == null) return;
+    for (var url in _metaInfo!.announces) {
+      tracker.restartTracker(url);
+    }
   }
 
   void _whenFileDownloadComplete(String filePath) {
@@ -355,13 +371,20 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     _dht?.onNewPeer(_processDHTPeer);
     // ignore: unawaited_futures
     _dht?.bootstrap();
-    if (_fileManager!.isAllComplete) {
-      // ignore: unawaited_futures
-      _tracker?.complete();
-    } else {
-      _tracker?.runTrackers(_metaInfo!.announces, _metaInfo!.infoHashBuffer!,
-          event: EVENT_STARTED);
-    }
+    // Анонс `started` шлём ВСЕГДА, в том числе для уже полного торрента.
+    //
+    // Раньше полный торрент уходил в ветку `_tracker.complete()`, а
+    // `TorrentAnnounceTracker.complete()` перебирает карту `_trackers`, которую
+    // заполняет только `runTracker()`/`runTrackers()`. На старте карта пуста →
+    // ни одного обращения к трекеру → чистого сида никто не находил (это и есть
+    // «0 роздано» после перезапуска приложения с уже скачанными книгами).
+    //
+    // Ветка была неверна и по протоколу: BEP 3 требует НЕ слать `completed`,
+    // если торрент был полон уже на старте клиента. Сид анонсируется как все,
+    // просто с `left=0` (см. [getOptions]).
+    // Покрыто: test/seeding_announce_test.dart.
+    _tracker?.runTrackers(_metaInfo!.announces, _metaInfo!.infoHashBuffer!,
+        event: EVENT_STARTED);
     return map;
   }
 
