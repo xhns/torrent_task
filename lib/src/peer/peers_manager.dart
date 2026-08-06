@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:developer';
 import 'dart:io';
 
 import 'package:torrent_model/torrent_model.dart';
@@ -85,6 +86,7 @@ class PeersManager with Holepunch, PEX {
       [this.maxWriteBufferSize = MAX_WRITE_BUFFER_SIZE]) {
     // hook FileManager and PieceManager
     _fileManager.onSubPieceWriteComplete(_processSubPieceWriteComplte);
+    _fileManager.onSubPieceWriteFailed(_processSubPieceWriteFailed);
     _fileManager.onSubPieceReadComplete(readSubPieceComplete);
     _pieceManager.onPieceComplete(_processPieceWriteComplete);
 
@@ -272,6 +274,31 @@ class PeersManager with Holepunch, PEX {
 
   void _processSubPieceWriteComplte(int pieceIndex, int begin, int length) {
     _pieceManager.processSubPieceWriteComplete(pieceIndex, begin, length);
+  }
+
+  /// Запись под-piece на диск провалилась (файл занят/нет места/нет прав, либо
+  /// piece не отображается ни в один файл).
+  ///
+  /// Сеть подтвердила запрос ещё ДО записи (`ackRequest` в
+  /// `Peer._processReceivePieces`), поэтому сам по себе блок никто не
+  /// перезапросит: без этого обработчика под-piece оставался в
+  /// `Piece._writtingSubPieces` навсегда, и загрузка замирала у самого финиша.
+  ///
+  /// Возвращаем под-piece в очередь и будим спящих пиров — иначе, если в полёте
+  /// не осталось ни одного запроса, `_requestPieces` никем не будет вызван и
+  /// вернувшийся в очередь блок так и не уйдёт в сеть.
+  void _processSubPieceWriteFailed(int pieceIndex, int begin, int length) {
+    var requeued =
+        _pieceManager.processSubPieceWriteFailed(pieceIndex, begin, length);
+    log(
+      'Запись под-piece ($pieceIndex, $begin, $length) провалилась, '
+      '${requeued ? 'возвращён в очередь докачки' : 'возврат не потребовался'}',
+      name: runtimeType.toString(),
+    );
+    if (!requeued) return;
+    for (var p in _activePeers) {
+      if (p.isSleeping) Timer.run(() => _requestPieces(p));
+    }
   }
 
   void _processPieceWriteComplete(int index) async {
@@ -666,6 +693,7 @@ class PeersManager with Holepunch, PEX {
     _endTime = DateTime.now().millisecondsSinceEpoch;
 
     _fileManager.offSubPieceWriteComplete(_processSubPieceWriteComplte);
+    _fileManager.offSubPieceWriteFailed(_processSubPieceWriteFailed);
     _fileManager.offSubPieceReadComplete(readSubPieceComplete);
     _pieceManager.offPieceComplete(_processPieceWriteComplete);
 

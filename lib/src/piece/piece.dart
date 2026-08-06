@@ -99,6 +99,32 @@ class Piece {
   }
 
   ///
+  /// Запись под-piece на диск ПРОВАЛИЛАСЬ — обратная операция к
+  /// [subPieceDownloadComplete].
+  ///
+  /// Без неё под-piece навсегда оставался в [_writtingSubPieces]: очередь
+  /// докачки пуста, [isCompleted] никогда не наступает (счётчик
+  /// `_downloadedSubPieces` не дорос), и piece не может ни завершиться, ни быть
+  /// перезапрошен — загрузка замирала на ~99% до ручной паузы+recheck.
+  ///
+  /// Возвращаем под-piece в НАЧАЛО очереди (addFirst): это остаток почти
+  /// готового куска, его выгодно дозабрать раньше новых.
+  ///
+  /// [pushSubPiece] здесь не годится — он отказывает как раз для тех индексов,
+  /// что лежат в [_writtingSubPieces]. Возвращает `true`, если под-piece
+  /// действительно вернулся в очередь.
+  bool subPieceWriteFailed(int begin) {
+    var subindex = begin ~/ DEFAULT_REQUEST_LENGTH;
+    // Не наш под-piece (или уже возвращён/дописан) — ничего не делаем.
+    if (!_writtingSubPieces.remove(subindex)) return false;
+    // Параллельная успешная запись того же блока другим пиром уже закрыла его.
+    if (_downloadedSubPieces.contains(subindex)) return false;
+    if (_subPiecesQueue!.contains(subindex)) return false;
+    _subPiecesQueue!.addFirst(subindex);
+    return true;
+  }
+
+  ///
   ///子Piece [subIndex]是否还在。
   ///
   ///当子Piece被弹出栈用于下载，或者子Piece已经下载完成，那么就视为该Piece已经不再包含该子Piece
