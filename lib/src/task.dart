@@ -268,8 +268,22 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     }
   }
 
+  /// Пир, найденный через Local Service Discovery (BEP 14).
+  ///
+  /// Раньше здесь стоял только отладочный `print` — найденный в локальной сети
+  /// пир выбрасывался, и раздача между двумя устройствами в одном Wi-Fi не
+  /// работала вовсе, даже когда трекер недоступен.
+  ///
+  /// Мультикаст-сокет LSD принимает анонсы ВСЕХ торрентов в сети, поэтому
+  /// infohash обязателен к сверке — иначе в сварм чужой книги полетели бы наши
+  /// подключения. Сравнение регистронезависимое: BEP 14 не фиксирует регистр
+  /// hex, и клиенты шлют по-разному.
+  /// Покрыто: test/lsd_peer_test.dart.
   void _processLSDPeerEvent(CompactAddress address, String infoHash) {
-    print('居然有LSD！！');
+    final mine = _metaInfo?.infoHash;
+    if (mine == null) return;
+    if (infoHash.toLowerCase() != mine.toLowerCase()) return;
+    _processNewPeerFound(address);
   }
 
   void _processNewPeerFound(CompactAddress url) {
