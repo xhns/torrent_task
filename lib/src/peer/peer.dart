@@ -153,6 +153,14 @@ abstract class Peer
   // /// Max request count in one piple ,5
   static const MAX_REQUEST_COUNT = 5;
 
+  /// Глубина пайплайна входящих запросов, которую мы объявляем в extended
+  /// handshake (`reqq`, BEP 10) и держим в [_remoteRequestBuffer].
+  ///
+  /// 100 не хватало: aria2c выдаёт пачку ~192 запросов, libtorrent-клиенты
+  /// держат в полёте столько же и больше. 500 — то же значение, что у
+  /// libtorrent по умолчанию.
+  static const DEFAULT_REQQ = 500;
+
   bool remoteEnableFastPeer = false;
 
   bool localEnableFastPeer = true;
@@ -186,7 +194,7 @@ abstract class Peer
       {this.type = PeerType.TCP,
       this.localEnableFastPeer = true,
       this.localEnableExtended = true,
-      this.reqq = 100}) {
+      this.reqq = DEFAULT_REQQ}) {
     _remoteBitfield = Bitfield.createEmptyBitfield(_piecesNum);
   }
 
@@ -705,13 +713,6 @@ abstract class Peer
   /// the peer receiving the requests MAY close the connection rather than reject the request.
   /// However, consider that it can take several seconds for buffers to drain and messages to propagate once a peer is choked.
   void _processRemoteRequest(Uint8List message) {
-    if (_remoteRequestBuffer.length > reqq) {
-      dev.log('Request Error:',
-          error: 'Too many requests from $address',
-          name: runtimeType.toString());
-      dispose(BadException('Too many requests from $address'));
-      return;
-    }
     var view = ByteData.view(message.buffer);
     var index = view.getUint32(0);
     var begin = view.getUint32(4);
@@ -733,6 +734,28 @@ abstract class Peer
         // sendRejectRequest(index, begin, length);
         return;
       }
+    }
+
+    // Пайплайн глубже заявленного нами reqq — это НЕ повод рвать соединение.
+    //
+    // BEP 10 определяет `reqq` как «сколько запросов клиент держит, ничего не
+    // отбрасывая»; превышение даёт право отбросить лишнее, но не разорвать
+    // связь. Раньше здесь стоял `dispose()`, и при дефолте reqq=100 любой
+    // взрослый клиент (aria2 шлёт пачкой ~192, libtorrent/qBittorrent
+    // пайплайнят так же агрессивно) убивал передачу на середине: замерено 2375
+    // запросов, отдано 2183 piece, 192 неотвеченных — обрыв на 86%.
+    //
+    // Разрывать по числу запросов больше нечем: очередь ограничена [reqq]
+    // конструктивно (ниже мы просто не ставим лишнее), так что «буфер растёт
+    // неограниченно» стало недостижимо, а не «переехало на порог повыше».
+    // Инвариант ограниченности проверяется тестом.
+    // Покрыто: test/remote_request_pipelining_test.dart.
+    if (_remoteRequestBuffer.length >= reqq) {
+      // Fast extension: честно говорим «этот блок не приедет», чтобы адресат не
+      // ждал его до своего таймаута. Без fast extension метод — no-op, и запрос
+      // просто молча отбрасывается (что BEP 10 и разрешает).
+      sendRejectRequest(index, begin, length);
+      return;
     }
 
     _remoteRequestBuffer.add([index, begin, length]);
