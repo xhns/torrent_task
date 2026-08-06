@@ -25,23 +25,29 @@ class NatUdpTransaction {
 
   final int serverPort;
 
-  NatUdpTransaction({this.serverPort = defaultServerPort});
+  /// Паузы между повторами. RFC 6886 предписывает начинать с 250 мс и
+  /// удваивать; число повторов равно длине списка.
+  final List<Duration> retryDelays;
+
+  static const List<Duration> defaultRetryDelays = [
+    Duration(milliseconds: 250),
+    Duration(milliseconds: 500),
+    Duration(milliseconds: 1000),
+  ];
+
+  NatUdpTransaction({
+    this.serverPort = defaultServerPort,
+    this.retryDelays = defaultRetryDelays,
+  });
 
   /// Разослать [payload] всем [gateways] и вернуть первый ответ, принятый
   /// предикатом [accept], либо `null` по истечении времени.
-  ///
-  /// [retryDelays] — паузы между повторами (RFC 6886 предписывает начинать с
-  /// 250 мс и удваивать). Число повторов равно длине списка.
   Future<GatewayReply?> request({
     required List<InternetAddress> gateways,
     required Uint8List payload,
     required bool Function(InternetAddress gateway, Uint8List data) accept,
-    List<Duration> retryDelays = const [
-      Duration(milliseconds: 250),
-      Duration(milliseconds: 500),
-      Duration(milliseconds: 1000),
-    ],
   }) async {
+    final retryDelays = this.retryDelays;
     if (gateways.isEmpty) return null;
     RawDatagramSocket? socket;
     try {
