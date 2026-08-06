@@ -81,9 +81,14 @@ class PeersManager with Holepunch, PEX {
 
   final String _localPeerId;
 
+  /// Наш слушающий TCP-порт — уходит каждому пиру в extended handshake (BEP 10,
+  /// поле `p`), чтобы к нам могли подключиться в ответ и рассказать о нас через
+  /// PEX. 0 = неизвестен.
+  final int localPort;
+
   PeersManager(this._localPeerId, this._pieceManager, this._pieceProvider,
       this._fileManager, this._metaInfo,
-      [this.maxWriteBufferSize = MAX_WRITE_BUFFER_SIZE]) {
+      [this.maxWriteBufferSize = MAX_WRITE_BUFFER_SIZE, this.localPort = 0]) {
     // hook FileManager and PieceManager
     _fileManager.onSubPieceWriteComplete(_processSubPieceWriteComplte);
     _fileManager.onSubPieceWriteFailed(_processSubPieceWriteFailed);
@@ -262,11 +267,13 @@ class PeersManager with Holepunch, PEX {
       Peer? peer;
       if (type == PeerType.TCP) {
         peer = Peer.newTCPPeer(_localPeerId, address, _metaInfo.infoHashBuffer!,
-            _metaInfo.pieces.length, socket);
+            _metaInfo.pieces.length, socket,
+            localPort: localPort);
       }
       if (type == PeerType.UTP) {
         peer = Peer.newUTPPeer(_localPeerId, address, _metaInfo.infoHashBuffer!,
-            _metaInfo.pieces.length, socket);
+            _metaInfo.pieces.length, socket,
+            localPort: localPort);
       }
       if (peer != null) _hookPeer(peer);
     }

@@ -184,6 +184,15 @@ abstract class Peer
 
   int? remoteReqq;
 
+  /// Наш собственный слушающий TCP-порт: уходит в extended handshake полем `p`
+  /// (BEP 10). 0 = неизвестен, тогда поле не отправляется.
+  ///
+  /// Без него пир, к которому подключились МЫ, видит наш исходящий эфемерный
+  /// порт и не знает, куда стучаться в ответ: он не переподключится к нам и не
+  /// расскажет о нас через PEX. aria2 в замере показывал tcpPort=0.
+  /// Покрыто: test/extended_handshake_test.dart.
+  final int localPort;
+
   ///
   /// [_id] 是用于区分不同Peer的Id，和[_localPeerId]不同，[_localPeerId]是bt协议中的Peer_id。
   /// [address]是远程peer的地址和端口，子类在实现的时候可以利用该值进行远程连接。[_infoHashBuffer]
@@ -194,22 +203,27 @@ abstract class Peer
       {this.type = PeerType.TCP,
       this.localEnableFastPeer = true,
       this.localEnableExtended = true,
-      this.reqq = DEFAULT_REQQ}) {
+      this.reqq = DEFAULT_REQQ,
+      this.localPort = 0}) {
     _remoteBitfield = Bitfield.createEmptyBitfield(_piecesNum);
   }
 
   factory Peer.newTCPPeer(String localPeerId, CompactAddress address,
       List<int> infoHashBuffer, int piecesNum, Socket? socket,
-      {bool enableExtend = true, bool enableFast = true}) {
+      {bool enableExtend = true, bool enableFast = true, int localPort = 0}) {
     return _TCPPeer(localPeerId, address, infoHashBuffer, piecesNum, socket,
-        enableExtend: enableExtend, enableFast: enableFast);
+        enableExtend: enableExtend,
+        enableFast: enableFast,
+        localPort: localPort);
   }
 
   factory Peer.newUTPPeer(String localPeerId, CompactAddress address,
       List<int> infoHashBuffer, int piecesNum, Socket? socket,
-      {bool enableExtend = true, bool enableFast = true}) {
+      {bool enableExtend = true, bool enableFast = true, int localPort = 0}) {
     return _UTPPeer(localPeerId, address, infoHashBuffer, piecesNum, socket as UTPSocket?,
-        enableExtend: enableExtend, enableFast: enableFast);
+        enableExtend: enableExtend,
+        enableFast: enableFast,
+        localPort: localPort);
   }
 
   /// 远程的Bitfield
@@ -903,6 +917,9 @@ abstract class Peer
     d['v'] = 'Dart BT v$version';
     d['m'] = localExtened;
     d['reqq'] = reqq;
+    // BEP 10: `p` — наш слушающий TCP-порт. Отдаём только если он реально
+    // известен: 0 в этом поле хуже отсутствия, его нельзя отличить от «порт 0».
+    if (localPort > 0) d['p'] = localPort;
     var m = encode(d);
     message.addAll(m as Iterable<int>);
     return message;
@@ -1266,7 +1283,7 @@ class _TCPPeer extends Peer {
   Socket? _socket;
   _TCPPeer(super.localPeerId, super.address, super.infoHashBuffer,
       super.piecesNum, this._socket,
-      {bool enableExtend = true, bool enableFast = true})
+      {bool enableExtend = true, bool enableFast = true, super.localPort})
       : super(type: PeerType.TCP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);
@@ -1318,7 +1335,7 @@ class _UTPPeer extends Peer {
   UTPSocket? _socket;
   _UTPPeer(super.localPeerId, super.address, super.infoHashBuffer,
       super.piecesNum, this._socket,
-      {bool enableExtend = true, bool enableFast = true})
+      {bool enableExtend = true, bool enableFast = true, super.localPort})
       : super(type: PeerType.UTP,
             localEnableExtended: enableExtend,
             localEnableFastPeer: enableFast);

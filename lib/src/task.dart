@@ -222,8 +222,8 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
         BasePieceSelector(), model, _stateFile!.bitfield);
     _fileManager ??= await DownloadFileManager.createFileManager(
         model, savePath, _stateFile!);
-    _peersManager ??= PeersManager(
-        _peerId!, _pieceManager!, _pieceManager!, _fileManager!, model);
+    _peersManager ??= PeersManager(_peerId!, _pieceManager!, _pieceManager!,
+        _fileManager!, model, MAX_WRITE_BUFFER_SIZE, _serverSocket?.port ?? 0);
     return _peersManager!;
   }
 
