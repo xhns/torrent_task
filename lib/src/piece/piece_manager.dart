@@ -63,6 +63,20 @@ class PieceManager implements PieceProvider {
     }
   }
 
+  /// Обратный колбэк FileManager: запись под-piece на диск провалилась.
+  ///
+  /// Возвращает под-piece в очередь докачки, чтобы его перезапросили у этого же
+  /// или у другого пира. Без этого piece навсегда застревал в незавершённом
+  /// состоянии (см. [Piece.subPieceWriteFailed]).
+  ///
+  /// Возвращает `true`, если под-piece действительно вернулся в очередь — тогда
+  /// вызывающей стороне есть смысл будить спящих пиров.
+  bool processSubPieceWriteFailed(int pieceIndex, int begin, int length) {
+    var piece = _pieces[pieceIndex];
+    if (piece == null || piece.isDisposed) return false;
+    return piece.subPieceWriteFailed(begin);
+  }
+
   Piece? selectPiece(String remotePeerId, List<int> remoteHavePieces,
       PieceProvider provider, final Set<int> suggestPieces) {
     // 查看当前下载piece中是否可以使用该peer

@@ -77,7 +77,19 @@ mixin CongestionControl {
     _timeout?.cancel();
     var requests = currentRequestBuffer;
     if (requests.isEmpty) return;
-    _timeout = Timer(Duration(microseconds: _rto.toInt()), () {
+    // Дедлайн привязан к САМОМУ СТАРОМУ невыполненному запросу, а не к моменту
+    // вызова. Раньше каждый `sendRequest` и каждый пришедший блок отменяли
+    // таймер и заводили его заново на полный `_rto`: пир, который отдаёт хоть
+    // что-то, бесконечно отодвигал дедлайн зависшего запроса, и тот никогда не
+    // добирался до `resend >= 3` — порога, по которому `PeersManager`
+    // возвращает под-piece в очередь. Итог: живое соединение, скорость 0.
+    var now = DateTime.now().microsecondsSinceEpoch;
+    var elapsed = now - requests.first[3];
+    // Нижняя граница — защита от busy-loop: если дедлайн уже прошёл, но цикл
+    // ниже не набрал ни одного просроченного запроса (дрожание часов),
+    // перепланирование не должно крутиться с нулевой задержкой.
+    var delay = max(1000, _rto.toInt() - elapsed);
+    _timeout = Timer(Duration(microseconds: delay), () {
       if (requests.isEmpty) return;
       if (times + 1 >= 5) {
         timeOutErrorHappen();
@@ -97,10 +109,16 @@ mixin CongestionControl {
         orderResendRequest(request[0], request[1], request[2], request[4]);
       }
 
-      times++;
-      _rto *= 2;
-      _allowWindowSize = DEFAULT_REQUEST_LENGTH;
-      fireRequestTimeoutEvent(timeoutR);
+      // Штрафуем окно и удваиваем RTO только если реально что-то просрочено.
+      // Таймер теперь может сработать «вхолостую» (дедлайн головы наступил, но
+      // она успела уйти из буфера) — схлопывать за это окно до одного блока
+      // значило бы душить скорость на ровном месте.
+      if (timeoutR.isNotEmpty) {
+        times++;
+        _rto *= 2;
+        _allowWindowSize = DEFAULT_REQUEST_LENGTH;
+        fireRequestTimeoutEvent(timeoutR);
+      }
       startRequestDataTimeout(times);
     });
   }

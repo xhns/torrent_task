@@ -237,7 +237,19 @@ class DownloadFileManager {
     var ps = pieceIndex * metainfo.pieceLength! + begin;
     var blockSize = block.length;
     var pe = ps + blockSize;
-    if (tempFiles == null || tempFiles.isEmpty) return;
+    if (tempFiles == null || tempFiles.isEmpty) {
+      // Раньше здесь был немой `return`: не летело ни `complete`, ни `failed`,
+      // а под-piece уже был переложен в `Piece._writtingSubPieces` — он
+      // застревал там навсегда и piece не мог завершиться. Отдаём `failed`,
+      // чтобы под-piece вернулся в очередь докачки по общему пути.
+      log(
+        'Не найдены файлы для piece $pieceIndex — запись под-piece '
+        '($begin, $blockSize) невозможна',
+        name: runtimeType.toString(),
+      );
+      _subPieceWriteFailed(pieceIndex, begin, blockSize);
+      return;
+    }
     var futures = <Future<bool>>[];
     for (var i = 0; i < tempFiles.length; i++) {
       var tempFile = tempFiles[i];
@@ -248,6 +260,17 @@ class DownloadFileManager {
       var subend = re['end'];
       futures.add(tempFile.requestWrite(position, block, substart, subend));
     }
+    if (futures.isEmpty) {
+      // Ни один файл не покрыл блок: `fold` по пустому потоку вернул бы `true`
+      // и мы отрапортовали бы об успешной записи того, что не записано (piece
+      // ушёл бы в bitfield с дырой). Считаем это провалом записи.
+      log(
+        'Блок ($pieceIndex, $begin, $blockSize) не покрыт ни одним файлом',
+        name: runtimeType.toString(),
+      );
+      _subPieceWriteFailed(pieceIndex, begin, blockSize);
+      return;
+    }
     Stream.fromFutures(futures).fold<bool>(true, (p, a) {
       return p && a;
     }).then((result) {
@@ -256,6 +279,18 @@ class DownloadFileManager {
       } else {
         _subPieceWriteFailed(pieceIndex, begin, blockSize);
       }
+    }, onError: (e) {
+      // `DownloadFile.requestWrite` возвращает `false` только на ошибках самой
+      // записи; открытие файла (`getRandomAccessFile`) кидает наружу —
+      // заблокированный антивирусом/индексатором файл, отозванные права,
+      // недоступный путь. Без этого обработчика ошибка уходила в unhandled, ни
+      // одно событие не летело, и под-piece навсегда оставался «пишущимся».
+      log(
+        'Ошибка записи под-piece ($pieceIndex, $begin, $blockSize)',
+        error: e,
+        name: runtimeType.toString(),
+      );
+      _subPieceWriteFailed(pieceIndex, begin, blockSize);
     });
     return;
   }
