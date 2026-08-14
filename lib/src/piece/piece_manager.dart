@@ -163,10 +163,16 @@ class PieceManager implements PieceProvider {
 
   Piece? selectPiece(String remotePeerId, List<int> remoteHavePieces,
       PieceProvider provider, final Set<int> suggestPieces) {
-    // 查看当前下载piece中是否可以使用该peer
-    var avalidatePiece = <int>[];
+    // Последовательный режим: обе эвристики ниже (suggest-куски пира и
+    // предпочтение уже начатых кусков) выбирают кусок МИМО селектора, а он в
+    // этом режиме — единственный, кто знает нужный порядок. Отдаём кандидатов
+    // целиком ему: suggest-кусок пир всё равно объявил своим, поэтому он есть
+    // в [remoteHavePieces] и будет выбран, когда до него дойдёт очередь.
+    // Держится тестом test/sequential_piece_selector_test.dart (группа
+    // «PieceManager + sequential»).
+    var strict = _pieceSelector.strictOrder;
     // 优先下载Suggest Pieces
-    if (suggestPieces.isNotEmpty) {
+    if (!strict && suggestPieces.isNotEmpty) {
       for (var i = 0; i < suggestPieces.length; i++) {
         var p = _pieces[suggestPieces.elementAt(i)];
         if (p != null && p.haveAvalidateSubPiece()) {
@@ -176,6 +182,23 @@ class PieceManager implements PieceProvider {
       }
     }
     var candidatePieces = remoteHavePieces;
+    if (!strict) {
+      candidatePieces = _preferDownloadingPieces(remotePeerId, candidatePieces);
+    }
+    var piece = _pieceSelector.selectPiece(
+        remotePeerId, candidatePieces, this, _isFirst);
+    _isFirst = false;
+    if (piece == null) return null;
+    processDownloadingPiece(piece.index!);
+    return piece;
+  }
+
+  /// Ограничить кандидатов уже начатыми кусками, которые этот пир может
+  /// докачать (принцип «несколько пиров добивают один кусок, чтобы он скорее
+  /// закрылся»). Если таких нет — список кандидатов остаётся прежним.
+  List<int> _preferDownloadingPieces(
+      String remotePeerId, List<int> candidatePieces) {
+    var avalidatePiece = <int>[];
     for (var i = 0; i < _donwloadingPieces.length; i++) {
       var p = _pieces[_donwloadingPieces.elementAt(i)];
       if (p == null) continue;
@@ -185,15 +208,8 @@ class PieceManager implements PieceProvider {
     }
 
     // 如果可以下载正在下载中的piece，就下载该piece（多个Peer同时下载一个piece使其尽快完成的原则）
-    if (avalidatePiece.isNotEmpty) {
-      candidatePieces = avalidatePiece;
-    }
-    var piece = _pieceSelector.selectPiece(
-        remotePeerId, candidatePieces, this, _isFirst);
-    _isFirst = false;
-    if (piece == null) return null;
-    processDownloadingPiece(piece.index!);
-    return piece;
+    if (avalidatePiece.isNotEmpty) return avalidatePiece;
+    return candidatePieces;
   }
 
   void processDownloadingPiece(int pieceIndex) {

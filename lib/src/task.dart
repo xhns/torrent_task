@@ -10,6 +10,7 @@ import 'package:dht_dart/dht_dart.dart';
 import 'package:utp/utp.dart';
 
 import 'file/download_file_manager.dart';
+import 'file/piece_layout.dart';
 import 'file/piece_verifier.dart';
 import 'file/recheck.dart';
 import 'file/state_file.dart';
@@ -17,8 +18,9 @@ import 'lsd/lsd.dart';
 import 'nat/port_mapper.dart';
 import 'nat/reachability.dart';
 import 'peer/peer.dart';
-import 'piece/base_piece_selector.dart';
 import 'piece/piece_manager.dart';
+import 'piece/piece_selector.dart';
+import 'piece/sequential_piece_selector.dart';
 import 'peer/peers_manager.dart';
 import 'utils.dart';
 
@@ -54,6 +56,14 @@ abstract class TorrentTask {
   ///
   /// [portMapper] позволяет подменить пробиватель порта — нужно тестам, чтобы
   /// не ходить в настоящую сеть.
+  ///
+  /// [sequential] переводит задачу на ПОСЛЕДОВАТЕЛЬНЫЙ выбор кусков
+  /// ([SequentialPieceSelector]) вместо стандартного rarest-first: нужно
+  /// режиму «слушать по мере скачивания», где первые файлы обязаны приехать
+  /// раньше остальных. По умолчанию `false` — поведение движка не меняется.
+  /// [pieceOrder] задаёт желаемый порядок кусков (самый нужный первым) и имеет
+  /// смысл только вместе с [sequential]; `null` — естественный порядок
+  /// индексов.
   factory TorrentTask.newTask(
     Torrent metaInfo,
     String savePath, {
@@ -61,12 +71,18 @@ abstract class TorrentTask {
     bool enableUtp = true,
     bool enablePortMapping = true,
     PortMapper? portMapper,
+    bool sequential = false,
+    List<int>? pieceOrder,
   }) {
+    assert(pieceOrder == null || sequential,
+        'pieceOrder без sequential:true ничего не делает');
     return _TorrentTask(metaInfo, savePath,
         listenPort: listenPort,
         enableUtp: enableUtp,
         enablePortMapping: enablePortMapping,
-        portMapper: portMapper);
+        portMapper: portMapper,
+        sequential: sequential,
+        pieceOrder: pieceOrder);
   }
   void startAnnounceUrl(Uri url, Uint8List infoHash);
 
@@ -127,6 +143,19 @@ abstract class TorrentTask {
   /// Пиры, отключённые за битые куски (`адрес:порт`), — к ним задача больше не
   /// подключается.
   Set<String> get bannedPeerIds;
+
+  /// Пути файлов торрента (относительные, как в metainfo), которые целиком
+  /// лежат на диске: КАЖДЫЙ кусок, покрывающий байты файла, подтверждён
+  /// локальным bitfield'ом.
+  ///
+  /// Считается по bitfield, а не по событиям [onFileComplete], и потому не
+  /// зависит ни от того, докачали файл в этом запуске или он поднялся из
+  /// recheck'а, ни от того, кому [DownloadFileManager] приписал кусок на стыке
+  /// файлов. Приложению это нужно, чтобы открывать на воспроизведение ровно те
+  /// файлы, которые дочитаны до последнего байта.
+  ///
+  /// Пустое множество, пока задача не инициализирована ([start]/[recheck]).
+  Set<String> get completedFiles;
 
   /// Force re-verify the files already present on disk against the torrent's
   /// piece hashes, rebuilding (and persisting) the local bitfield.
@@ -257,6 +286,12 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
   int _incomingUtpCount = 0;
   int _incomingWanCount = 0;
 
+  /// Последовательный режим выбора кусков и желаемый порядок кусков в нём
+  /// (см. [TorrentTask.newTask]).
+  final bool _sequential;
+
+  final List<int>? _pieceOrder;
+
   _TorrentTask(
     this._metaInfo,
     this._savePath, {
@@ -264,10 +299,14 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     bool enableUtp = true,
     bool enablePortMapping = true,
     PortMapper? portMapper,
+    bool sequential = false,
+    List<int>? pieceOrder,
   })  : _configuredPort = listenPort,
         _enableUtp = enableUtp,
         _enablePortMapping = enablePortMapping,
-        _portMapper = portMapper {
+        _portMapper = portMapper,
+        _sequential = sequential,
+        _pieceOrder = pieceOrder {
     _peerId = generatePeerId();
   }
 
@@ -321,7 +360,9 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
     // 3 ГБ кусков тысячи, а SHA1 в главном изоляте дёргал бы UI приложения.
     _pieceVerifier ??= await IsolatePieceVerifier.spawn(model, savePath);
     _pieceManager ??= PieceManager.createPieceManager(
-        BasePieceSelector(), model, _stateFile!.bitfield,
+        createPieceSelector(sequential: _sequential, pieceOrder: _pieceOrder),
+        model,
+        _stateFile!.bitfield,
         verifier: _pieceVerifier);
     _fileManager ??= await DownloadFileManager.createFileManager(
         model, savePath, _stateFile!);
@@ -859,6 +900,14 @@ class _TorrentTask implements TorrentTask, AnnounceOptionsProvider {
 
   @override
   Set<String> get bannedPeerIds => _peersManager?.bannedPeerIds ?? const {};
+
+  @override
+  Set<String> get completedFiles {
+    var model = _metaInfo;
+    var stateFile = _stateFile;
+    if (model == null || stateFile == null) return const {};
+    return completedFilesOf(model, stateFile.bitfield.getBit);
+  }
 
   void _fireTaskPaused() {
     for (var element in _pauseHandlers) {

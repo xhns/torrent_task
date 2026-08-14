@@ -107,6 +107,57 @@ class TorrentDiskLayout {
   }
 }
 
+/// Диапазон кусков `[first, last]`, покрывающих байты файла с длиной [length],
+/// начинающегося в глобальном смещении [offset]. Для пустого файла возвращает
+/// `null` (покрывать нечего).
+///
+/// Тот же расчёт, что делает `DownloadFileManager._initFileMap`, но без
+/// зависимости от списка `DownloadFile`: считается прямо по байтовой раскладке
+/// торрента.
+({int first, int last})? pieceRangeOfFile(
+    {required int offset, required int length, required int pieceLength}) {
+  if (length <= 0 || pieceLength <= 0) return null;
+  final first = offset ~/ pieceLength;
+  final last = (offset + length - 1) ~/ pieceLength;
+  return (first: first, last: last);
+}
+
+/// Пути файлов [metainfo] (относительные, как в торренте), КАЖДЫЙ кусок
+/// которых подтверждён локально: [have] отвечает по индексу куска.
+///
+/// Это единственный честный ответ на вопрос «этот файл дочитан до последнего
+/// байта»: событие `DownloadFileManager.onFileComplete` про кусок на стыке
+/// файлов знает только у ОДНОГО из соседей (кусок приписывается первому из
+/// них), а про файлы, поднятые recheck'ом, не стреляет вовсе.
+///
+/// Файлы нулевой длины считаются готовыми: покрывать в них нечего.
+Set<String> completedFilesOf(
+    Torrent metainfo, bool Function(int pieceIndex) have) {
+  final pieceLength = metainfo.pieceLength;
+  if (pieceLength == null || pieceLength <= 0) return const {};
+  final piecesCount = metainfo.pieces.length;
+  final done = <String>{};
+  for (final f in metainfo.files) {
+    final range = pieceRangeOfFile(
+        offset: f.offset, length: f.length, pieceLength: pieceLength);
+    if (range == null) {
+      done.add(f.path);
+      continue;
+    }
+    var complete = true;
+    for (var i = range.first; i <= range.last; i++) {
+      // Индекс за пределами торрента — раскладка не сходится; файл готовым не
+      // считаем (лучше недосказать, чем отдать на воспроизведение дыру).
+      if (i < 0 || i >= piecesCount || !have(i)) {
+        complete = false;
+        break;
+      }
+    }
+    if (complete) done.add(f.path);
+  }
+  return done;
+}
+
 /// Кэш read-хэндлов по пути файла: многофайловый торрент не должен открывать
 /// один и тот же файл на каждый кусок.
 ///

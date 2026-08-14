@@ -71,8 +71,17 @@ class DownloadFile {
   /// 处理读写请求
   ///
   /// 每次只处理一个请求。`Stream`在进入该方法后通过`StreamSubscription`暂停通道信息读取，直到处理完一条请求后才恢复
+  /// `?.` вместо `!` — не косметика: [close] отменяет подписку и обнуляет
+  /// [_ss], пока обработчик УЖЕ висит на своём `await` (запись/чтение/flush в
+  /// полёте), и вернувшийся из ожидания `_ss!.resume()` падал «Null check
+  /// operator used on a null value». Ошибка асинхронная и никем не ловится —
+  /// она всплывала unhandled ровно на штатном действии пользователя: пауза или
+  /// остановка загрузки на лету. Держится тестом
+  /// test/sequential_download_e2e_test.dart: он штатно останавливает задачу
+  /// посреди загрузки, и на `!` этот тест падает unhandled-ошибкой
+  /// (проверено мутацией).
   void _processRequest(event) async {
-    _ss!.pause();
+    _ss?.pause();
     if (event['type'] == WRITE) {
       await _write(event);
     }
@@ -82,7 +91,7 @@ class DownloadFile {
     if (event['type'] == FLUSH) {
       await _flush(event);
     }
-    _ss!.resume();
+    _ss?.resume();
   }
 
   Future _write(event) async {

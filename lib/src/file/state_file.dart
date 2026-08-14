@@ -164,15 +164,25 @@ class StateFile {
     return update(-1, uploaded: uploaded);
   }
 
+  /// Обработчик очереди операций.
+  ///
+  /// `?.` вместо `!` — не косметика: [close] отменяет подписку и обнуляет
+  /// [_ss], пока обработчик УЖЕ висит на своём `await`, и вернувшийся из
+  /// ожидания `_ss!.resume()` падал «Null check operator used on a null
+  /// value». Ошибка асинхронная и никем не ловится — она всплывала unhandled
+  /// ровно на штатном действии пользователя: пауза/остановка задачи на лету.
+  /// Держится тестом test/sequential_download_e2e_test.dart: он штатно
+  /// останавливает задачу посреди загрузки, и на `!` этот тест падает
+  /// unhandled-ошибкой (проверено мутацией).
   void _processRequest(event) async {
-    _ss!.pause();
+    _ss?.pause();
     // if (event['type'] == 'all') {
     //   await _updateAll(event);
     // }
     if (event['type'] == 'single') {
       await _update(event);
     }
-    _ss!.resume();
+    _ss?.resume();
   }
 
   Future<RandomAccessFile> getAccess() async {

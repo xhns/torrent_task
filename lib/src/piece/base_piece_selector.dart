@@ -21,6 +21,11 @@ import 'piece_selector.dart';
 /// 改变是否走 rarest-first：无论 `random` 是 `true` 还是 `false`，返回的
 /// 都是真正最稀有的 `Piece`。
 class BasePieceSelector implements PieceSelector {
+  /// rarest-first не строгий: эвристики [PieceManager] (suggest-куски пира,
+  /// предпочтение уже начатых кусков) остаются в силе, как и было.
+  @override
+  bool get strictOrder => false;
+
   @override
   Piece? selectPiece(
       String remotePeerId, List<int> piecesIndexList, PieceProvider provider,
